@@ -52,7 +52,7 @@ static PREBAKED: [&[u8]; 6] = [
 ];
 
 struct AppState {
-    search: VectorSearch,
+    search: Arc<VectorSearch>,
 }
 
 type SharedState = Arc<AppState>;
@@ -69,17 +69,25 @@ async fn main() {
         .unwrap_or_else(|_| format!("{}/index.bin.gz", data_dir));
 
     info!("Loading index from {}...", index_path);
-    let search = rinha_core::vector::VectorSearch::load(&index_path);
+    // Load index synchronously — fast (~1-2s for 18MB gz)
+    let search = tokio::task::spawn_blocking(move || {
+        rinha_core::vector::VectorSearch::load(&index_path)
+    })
+    .await
+    .expect("Index loading failed");
+
     info!(
-        "Index built in {:?}. ~{} MB, {} centroids, {} blocks",
+        "Index loaded in {:?}. ~{} MB, {} centroids, {} blocks, {} vectors",
         start.elapsed(),
         search.memory_usage() / 1048576,
         search.k,
-        search.total_blocks
+        search.total_blocks,
+        search.count,
     );
-    info!("Startup: {:?}", start.elapsed());
 
-    let state = Arc::new(AppState { search });
+    info!("Startup complete: {:?}", start.elapsed());
+
+    let state = Arc::new(AppState { search: Arc::new(search) });
     let app = Router::new()
         .route("/ready", get(|| async { StatusCode::OK }))
         .route("/fraud-score", post(fraud_score))
@@ -99,7 +107,15 @@ async fn fraud_score(
 ) -> Result<&'static [u8], StatusCode> {
     let q = parse_body_fast(&body)?;
 
-    let neighbors = state.search.search_with_probe(&q, 4);
+    // Move the CPU-intensive search to the blocking thread pool
+    // so it doesn't starve tokio's async workers.
+    let search = state.search.clone();
+    let neighbors = tokio::task::spawn_blocking(move || {
+        search.search_with_probe(&q, 4)
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
     let fraud_count = neighbors.iter().filter(|r| r.label == 1).count();
     let n = neighbors.len().max(1);
     let score = fraud_count as f32 / n as f32;
@@ -115,7 +131,6 @@ async fn fraud_score(
 struct Parser<'a> {
     s: &'a [u8],
     pos: usize,
-    // Parsed values
     tx_amount: f32,
     tx_installments: i32,
     tx_requested_at: &'a [u8],
@@ -186,13 +201,12 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Read a JSON string, returning its byte content (without quotes).
     fn read_string(&mut self) -> &'a [u8] {
         self.skip_ws();
         if self.pos >= self.s.len() || self.s[self.pos] != b'"' {
             return b"";
         }
-        self.pos += 1; // skip opening "
+        self.pos += 1;
         let start = self.pos;
         while self.pos < self.s.len() && self.s[self.pos] != b'"' {
             self.pos += 1;
@@ -200,11 +214,10 @@ impl<'a> Parser<'a> {
         let result = &self.s[start..self.pos];
         if self.pos < self.s.len() {
             self.pos += 1;
-        } // skip closing "
+        }
         result
     }
 
-    /// Read a JSON number (int or float).
     fn read_number(&mut self) -> f32 {
         self.skip_ws();
         let start = self.pos;
@@ -243,7 +256,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Skip null literal.
     fn read_null(&mut self) {
         self.skip_ws();
         if self.pos + 4 <= self.s.len() && &self.s[self.pos..self.pos + 4] == b"null" {
@@ -251,7 +263,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Skip any JSON value (string, number, bool, null, array, object).
     fn skip_value(&mut self) {
         self.skip_ws();
         if self.pos >= self.s.len() {
@@ -300,7 +311,6 @@ impl<'a> Parser<'a> {
                 }
             }
             _ => {
-                // number
                 while self.pos < self.s.len()
                     && (self.s[self.pos].is_ascii_digit()
                         || self.s[self.pos] == b'.'
@@ -315,12 +325,10 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Read a field key (the part after '"' up to the next '"').
     fn read_key(&mut self) -> &'a [u8] {
         self.read_string()
     }
 
-    /// After a key, expect ':' and skip whitespace.
     fn expect_colon(&mut self) {
         self.skip_ws();
         if self.pos < self.s.len() && self.s[self.pos] == b':' {
@@ -330,11 +338,9 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_all(&mut self) {
-        // Expect root '{'
         if !self.expect(b'{') {
             return;
         }
-
         while self.pos < self.s.len() {
             self.skip_ws();
             match self.peek() {
@@ -346,9 +352,7 @@ impl<'a> Parser<'a> {
                     let key = self.read_key();
                     self.expect_colon();
                     match key {
-                        b"id" => {
-                            self.skip_value();
-                        }
+                        b"id" => self.skip_value(),
                         b"transaction" => self.parse_tx(),
                         b"customer" => self.parse_cust(),
                         b"merchant" => self.parse_merch(),
@@ -363,31 +367,20 @@ impl<'a> Parser<'a> {
                                 self.parse_last();
                             }
                         }
-                        _ => {
-                            self.skip_value();
-                        }
+                        _ => self.skip_value(),
                     }
                 }
-                b',' => {
-                    self.advance();
-                }
-                _ => {
-                    self.advance();
-                }
+                b',' => { self.advance(); }
+                _ => { self.advance(); }
             }
         }
     }
 
     fn parse_tx(&mut self) {
-        if !self.expect(b'{') {
-            return;
-        }
+        if !self.expect(b'{') { return; }
         while self.pos < self.s.len() {
             self.skip_ws();
-            if self.peek() == b'}' {
-                self.advance();
-                break;
-            }
+            if self.peek() == b'}' { self.advance(); break; }
             let key = self.read_key();
             self.expect_colon();
             match key {
@@ -401,15 +394,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_cust(&mut self) {
-        if !self.expect(b'{') {
-            return;
-        }
+        if !self.expect(b'{') { return; }
         while self.pos < self.s.len() {
             self.skip_ws();
-            if self.peek() == b'}' {
-                self.advance();
-                break;
-            }
+            if self.peek() == b'}' { self.advance(); break; }
             let key = self.read_key();
             self.expect_colon();
             match key {
@@ -439,15 +427,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_merch(&mut self) {
-        if !self.expect(b'{') {
-            return;
-        }
+        if !self.expect(b'{') { return; }
         while self.pos < self.s.len() {
             self.skip_ws();
-            if self.peek() == b'}' {
-                self.advance();
-                break;
-            }
+            if self.peek() == b'}' { self.advance(); break; }
             let key = self.read_key();
             self.expect_colon();
             match key {
@@ -461,15 +444,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_term(&mut self) {
-        if !self.expect(b'{') {
-            return;
-        }
+        if !self.expect(b'{') { return; }
         while self.pos < self.s.len() {
             self.skip_ws();
-            if self.peek() == b'}' {
-                self.advance();
-                break;
-            }
+            if self.peek() == b'}' { self.advance(); break; }
             let key = self.read_key();
             self.expect_colon();
             match key {
@@ -483,15 +461,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_last(&mut self) {
-        if !self.expect(b'{') {
-            return;
-        }
+        if !self.expect(b'{') { return; }
         while self.pos < self.s.len() {
             self.skip_ws();
-            if self.peek() == b'}' {
-                self.advance();
-                break;
-            }
+            if self.peek() == b'}' { self.advance(); break; }
             let key = self.read_key();
             self.expect_colon();
             match key {
@@ -508,12 +481,10 @@ impl<'a> Parser<'a> {
         q[0] = (self.tx_amount / MAX_AMOUNT).clamp(0.0, 1.0);
         q[1] = (self.tx_installments as f32 / MAX_INSTALLMENTS).clamp(0.0, 1.0);
         q[2] = ((self.tx_amount / self.cust_avg_amount) / AMOUNT_VS_AVG_RATIO).clamp(0.0, 1.0);
-
         if !self.tx_requested_at.is_empty() {
             q[3] = parse_hour_raw(self.tx_requested_at) as f32 / 23.0;
             q[4] = parse_dow_raw(self.tx_requested_at) as f32 / 6.0;
         }
-
         if self.has_last && !self.last_ts.is_empty() {
             let minutes = minutes_between_raw(self.last_ts, self.tx_requested_at).max(0) as f32;
             q[5] = (minutes / MAX_MINUTES).clamp(0.0, 1.0);
@@ -529,11 +500,7 @@ impl<'a> Parser<'a> {
         q[11] = if self.known_merchants[..self.known_count]
             .iter()
             .any(|m| *m == self.merch_id)
-        {
-            0.0
-        } else {
-            1.0
-        };
+        { 0.0 } else { 1.0 };
         q[12] = mcc_risk(self.merch_mcc);
         q[13] = (self.merch_avg_amount / MAX_MERCHANT_AVG).clamp(0.0, 1.0);
         q
@@ -554,14 +521,13 @@ mod tests {
     fn test_parser_legit_example() {
         let body = br#"{"id":"tx-1329056812","transaction":{"amount":41.12,"installments":2,"requested_at":"2026-03-11T18:45:53Z"},"customer":{"avg_amount":82.24,"tx_count_24h":3,"known_merchants":["MERC-003","MERC-016"]},"merchant":{"id":"MERC-016","mcc":"5411","avg_amount":60.25},"terminal":{"is_online":false,"card_present":true,"km_from_home":29.23},"last_transaction":null}"#;
         let q = parse_body_fast(body).unwrap();
-        // Expected: [0.0041, 0.1667, 0.05, 0.7826, 0.3333, -1, -1, 0.0292, 0.15, 0, 1, 0, 0.15, 0.006]
         eprintln!("LEGIT: [{:.4}, {:.4}, {:.4}, {:.4}, {:.4}, {:.4}, {:.4}, {:.4}, {:.4}, {:.4}, {:.4}, {:.4}, {:.4}, {:.4}]",
             q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7], q[8], q[9], q[10], q[11], q[12], q[13]);
         assert!((q[0] - 0.0041).abs() < 0.001, "dim0: {}", q[0]);
         assert!((q[1] - 0.1667).abs() < 0.001, "dim1: {}", q[1]);
         assert!((q[2] - 0.05).abs() < 0.001, "dim2: {}", q[2]);
-        assert!((q[5] + 1.0).abs() < 0.001, "dim5: {}", q[5]); // -1
-        assert!((q[6] + 1.0).abs() < 0.001, "dim6: {}", q[6]); // -1
+        assert!((q[5] + 1.0).abs() < 0.001, "dim5: {}", q[5]);
+        assert!((q[6] + 1.0).abs() < 0.001, "dim6: {}", q[6]);
         assert!((q[7] - 0.0292).abs() < 0.001, "dim7: {}", q[7]);
         assert!((q[8] - 0.15).abs() < 0.001, "dim8: {}", q[8]);
         assert!((q[12] - 0.15).abs() < 0.001, "dim12: {}", q[12]);
@@ -571,7 +537,6 @@ mod tests {
     fn test_parser_fraud_example() {
         let body = br#"{"id":"tx-3330991687","transaction":{"amount":9505.97,"installments":10,"requested_at":"2026-03-14T05:15:12Z"},"customer":{"avg_amount":81.28,"tx_count_24h":20,"known_merchants":["MERC-008","MERC-007","MERC-005"]},"merchant":{"id":"MERC-068","mcc":"7802","avg_amount":54.86},"terminal":{"is_online":false,"card_present":true,"km_from_home":952.27},"last_transaction":null}"#;
         let q = parse_body_fast(body).unwrap();
-        // Expected: [0.9506, 0.8333, 1.0, 0.2174, 0.8333, -1, -1, 0.9523, 1.0, 0, 1, 1, 0.75, 0.0055]
         eprintln!("FRAUD: [{:.4}, {:.4}, {:.4}, {:.4}, {:.4}, {:.4}, {:.4}, {:.4}, {:.4}, {:.4}, {:.4}, {:.4}, {:.4}, {:.4}]",
             q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7], q[8], q[9], q[10], q[11], q[12], q[13]);
         assert!((q[0] - 0.9506).abs() < 0.001, "dim0: {}", q[0]);
@@ -584,37 +549,26 @@ mod tests {
 }
 
 fn parse_hour_raw(iso: &[u8]) -> u8 {
-    if iso.len() < 13 {
-        return 0;
-    }
+    if iso.len() < 13 { return 0; }
     (iso[11] - b'0') * 10 + (iso[12] - b'0')
 }
 
 fn parse_dow_raw(iso: &[u8]) -> u8 {
-    if iso.len() < 10 {
-        return 0;
-    }
-    let y = (iso[0] - b'0') as i32 * 1000
-        + (iso[1] - b'0') as i32 * 100
-        + (iso[2] - b'0') as i32 * 10
-        + (iso[3] - b'0') as i32;
+    if iso.len() < 10 { return 0; }
+    let y = (iso[0] - b'0') as i32 * 1000 + (iso[1] - b'0') as i32 * 100
+        + (iso[2] - b'0') as i32 * 10 + (iso[3] - b'0') as i32;
     let m = (iso[5] - b'0') as u32 * 10 + (iso[6] - b'0') as u32;
     let d = (iso[8] - b'0') as u32 * 10 + (iso[9] - b'0') as u32;
     let (ym, mm) = if m < 3 { (y - 1, m + 12) } else { (y, m) };
     static T: [u32; 12] = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
-    ((ym as u32 + ym as u32 / 4 - ym as u32 / 100 + ym as u32 / 400 + T[mm as usize - 1] + d + 6)
-        % 7) as u8
+    ((ym as u32 + ym as u32 / 4 - ym as u32 / 100 + ym as u32 / 400 + T[mm as usize - 1] + d + 6) % 7) as u8
 }
 
 fn minutes_between_raw(start: &[u8], end: &[u8]) -> i64 {
     fn parse_minutes(iso: &[u8]) -> i64 {
-        if iso.len() < 19 {
-            return 0;
-        }
-        let y = (iso[0] - b'0') as i64 * 1000
-            + (iso[1] - b'0') as i64 * 100
-            + (iso[2] - b'0') as i64 * 10
-            + (iso[3] - b'0') as i64;
+        if iso.len() < 19 { return 0; }
+        let y = (iso[0] - b'0') as i64 * 1000 + (iso[1] - b'0') as i64 * 100
+            + (iso[2] - b'0') as i64 * 10 + (iso[3] - b'0') as i64;
         let mo = (iso[5] - b'0') as i64 * 10 + (iso[6] - b'0') as i64;
         let d = (iso[8] - b'0') as i64 * 10 + (iso[9] - b'0') as i64;
         let h = (iso[11] - b'0') as i64 * 10 + (iso[12] - b'0') as i64;
