@@ -1,0 +1,22 @@
+[package]
+name = "rinha-testsuite"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rinha-core = { path = "../core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+half = "2"
+
+[[bin]]
+name = "rinha-testsuite"
+path = "src/main.rs"
+
+[[bin]]
+name = "rinha-testsuite-load"
+path = "src/main_load.rs"
+
+[[bin]]
+name = "rinha-i8test"
+path = "src/main_i8test.rs"
