@@ -1,9 +1,6 @@
 services:
   api-1:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: rinha-api:latest
+    image: ttl.sh/rinha-gustavo-2026:24h
     environment:
       - PORT=8080
       - DATA_DIR=/app/data
@@ -17,10 +14,7 @@ services:
     restart: unless-stopped
 
   api-2:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: rinha-api:latest
+    image: ttl.sh/rinha-gustavo-2026:24h
     environment:
       - PORT=8080
       - DATA_DIR=/app/data
