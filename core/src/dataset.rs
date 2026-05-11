@@ -2,7 +2,6 @@ use flate2::read::GzDecoder;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader};
 
 /// Normalization constants from normalization.json
 #[derive(Debug, Clone, Deserialize)]

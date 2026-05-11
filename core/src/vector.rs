@@ -1,8 +1,5 @@
-use std::ptr;
-
 pub const DIMS: usize = 14;
 pub const N_CLUSTERS: usize = 512;
-const KMEANS_ITERS: usize = 15;
 
 /// IVF-based vector search using k-means clustering.
 /// Vectors stored as f16 for fast SIMD using native F16C conversion.
@@ -167,6 +164,7 @@ impl VectorSearch {
         (0..filled).map(|i| { let (d, id, lb) = top[order[i]]; SearchResult { node_id: id, distance: d, label: lb } }).collect()
     }
 
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
     fn search_scalar(&self, query: &[f32; DIMS], clusters: &[usize]) -> Vec<SearchResult> {
         let mut top = [(f32::MAX, 0u32, 0u8); 5];
         let mut filled = 0usize;
@@ -215,6 +213,7 @@ fn find_closest_centroids_simd(query: &[f32; DIMS], centroids: &[u16], k: usize,
     dists_slice[..n].iter().map(|&(_, c)| c).collect()
 }
 
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
 fn find_closest_centroids_scalar(query: &[f32; DIMS], centroids: &[u16], k: usize, n: usize) -> Vec<usize> {
     let mut dists = [(f32::MAX, 0usize); 512];
     for c in 0..k {
