@@ -5,21 +5,10 @@ use crate::vector;
 
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
 
 const RX_CAP: usize = 8192;
 
-pub fn serve(sock_path: &str) -> std::io::Result<()> {
-    let path = PathBuf::from(sock_path);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::remove_file(&path);
-
-    let listener = UnixListener::bind(&path)?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))?;
-
+pub fn serve(listener: UnixListener) -> std::io::Result<()> {
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
@@ -86,6 +75,9 @@ fn handle_conn(stream: &mut UnixStream) {
 }
 
 fn handle_request(path: &[u8], body: &[u8]) -> &'static [u8] {
+    if !crate::is_ready() {
+        return RESP_NOT_READY;
+    }
     if path == b"/ready" {
         return RESP_READY;
     }
@@ -186,3 +178,4 @@ pub const HTTP_FRAUD: [&[u8]; 6] = [
 pub const RESP_READY: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
 pub const RESP_NOT_FOUND: &[u8] = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
 pub const RESP_BAD: &[u8] = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+pub const RESP_NOT_READY: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
