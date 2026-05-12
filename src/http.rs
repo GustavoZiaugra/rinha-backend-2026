@@ -57,13 +57,7 @@ fn handle_conn(stream: &mut UnixStream) {
             }
         };
 
-        let content_len = match parse_content_length(&buf[..header_end]) {
-            Some(len) => len,
-            None => {
-                let _ = stream.write_all(RESP_BAD);
-                break;
-            }
-        };
+        let content_len = parse_content_length(&buf[..header_end]).unwrap_or(0);
 
         let total_len = header_end + 4 + content_len;
         if used < total_len {
