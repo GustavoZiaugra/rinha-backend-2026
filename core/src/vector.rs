@@ -25,74 +25,73 @@ impl VectorSearch {
     pub fn load(path: &str) -> Self {
         use std::io::Read;
         let file = std::fs::File::open(path).unwrap();
-        let mut decoder = flate2::read::GzDecoder::new(file);
-        let mut buf = Vec::new();
-        decoder.read_to_end(&mut buf).unwrap();
+        let mut r = flate2::read::GzDecoder::new(file);
 
-        let mut pos = 0;
-        let magic = &buf[pos..pos + 4];
-        pos += 4;
-        assert_eq!(magic, b"IVF1", "Bad magic");
+        let mut tmp4 = [0u8; 4];
+        r.read_exact(&mut tmp4).unwrap();
+        assert_eq!(&tmp4, b"IVF1", "Bad magic");
 
-        let count = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
-        pos += 4;
-        let k = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
-        pos += 4;
-        let dims = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
-        pos += 4;
+        r.read_exact(&mut tmp4).unwrap();
+        let count = u32::from_le_bytes(tmp4) as usize;
+        r.read_exact(&mut tmp4).unwrap();
+        let k = u32::from_le_bytes(tmp4) as usize;
+        r.read_exact(&mut tmp4).unwrap();
+        let dims = u32::from_le_bytes(tmp4) as usize;
         assert_eq!(dims, DIMS);
 
-        // Centroids (SOA f32): k * DIMS floats
-        let cent_bytes = k * DIMS * 4;
-        let centroids_f32: Vec<f32> = bytemuck::cast_slice(&buf[pos..pos + cent_bytes]).to_vec();
-        pos += cent_bytes;
-        // Convert centroids from SOA to AOS
+        // Read centroids (SOA f32) and convert to AOS f16 on the fly
         let mut centroids = vec![0u16; k * DIMS];
-        for ci in 0..k {
-            for d in 0..DIMS {
-                let f = centroids_f32[d * k + ci];
-                centroids[ci * DIMS + d] = half::f16::from_f32(f).to_bits();
+        let mut soa_buf = vec![0f32; k]; // one dimension at a time
+        for d in 0..DIMS {
+            let bytes = bytemuck::cast_slice_mut(&mut soa_buf);
+            r.read_exact(bytes).unwrap();
+            for ci in 0..k {
+                centroids[ci * DIMS + d] = half::f16::from_f32(soa_buf[ci]).to_bits();
             }
         }
 
-        // Offsets: (k+1) u32
-        let off_bytes = (k + 1) * 4;
-        let offsets_raw: &[u32] = bytemuck::cast_slice(&buf[pos..pos + off_bytes]);
-        pos += off_bytes;
+        // Read offsets
+        let mut offsets_raw = vec![0u32; k + 1];
+        let off_bytes = bytemuck::cast_slice_mut(&mut offsets_raw);
+        r.read_exact(off_bytes).unwrap();
 
         let total_blocks_stored = offsets_raw[k] as usize;
-        let label_count = total_blocks_stored * 8;
-        let labels_raw = buf[pos..pos + label_count].to_vec();
-        pos += label_count;
 
-        // Blocks: i16 SOA per block [dim0*8, dim1*8, ..., dim13*8]
-        let block_i16: &[i16] = bytemuck::cast_slice(&buf[pos..]);
-
-        // De-interleave blocks into f16 vectors (AOS)
+        // Pre-allocate final arrays
         let mut vectors = vec![0u16; count * DIMS];
         let mut reordered_labels = vec![0u8; count];
-        let mut vi = 0usize;
         let mut cluster_offsets = Vec::with_capacity(k);
-        let mut start_pos = 0usize;
 
+        // Process cluster by cluster: read labels+blocks for one cluster,
+        // de-interleave, then drop temp buffers before next cluster.
+        let mut vi = 0usize;
+        let mut start_pos = 0usize;
         for ci in 0..k {
             let block_start = offsets_raw[ci] as usize;
             let block_end = offsets_raw[ci + 1] as usize;
             let n_blocks = block_end - block_start;
 
+            // Read labels for this cluster only
+            let mut labels_temp = vec![0u8; n_blocks * 8];
+            r.read_exact(&mut labels_temp).unwrap();
+
+            // Read blocks for this cluster only
+            let mut blocks_temp = vec![0i16; n_blocks * DIMS * 8];
+            let block_bytes = bytemuck::cast_slice_mut(&mut blocks_temp);
+            r.read_exact(block_bytes).unwrap();
+
+            // De-interleave directly into final arrays
             for bi in 0..n_blocks {
-                let base_block = (block_start + bi) * DIMS * 8;
+                let base_block = bi * DIMS * 8;
                 for slot in 0..8 {
                     let global_idx = block_start * 8 + bi * 8 + slot;
-                    if global_idx >= count { break; }
-                    if vi >= count { break; }
-
+                    if global_idx >= count || vi >= count { break; }
                     for d in 0..DIMS {
-                        let i16_val = block_i16[base_block + d * 8 + slot];
+                        let i16_val = blocks_temp[base_block + d * 8 + slot];
                         let f32_val = i16_val as f32 / 10000.0;
                         vectors[vi * DIMS + d] = half::f16::from_f32(f32_val).to_bits();
                     }
-                    reordered_labels[vi] = labels_raw[global_idx];
+                    reordered_labels[vi] = labels_temp[bi * 8 + slot];
                     vi += 1;
                 }
             }
