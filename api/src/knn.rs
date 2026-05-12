@@ -2,8 +2,8 @@ use crate::data::{self, Dataset};
 use std::arch::x86_64::*;
 use std::mem::MaybeUninit;
 
-const FAST_NPROBE: usize = 5;
-const FULL_NPROBE: usize = 24;
+const FAST_NPROBE: usize = 2;
+const FULL_NPROBE: usize = 6;
 const MAX_CENTROIDS: usize = 4096;
 const VECTOR_SCALE: f32 = 0.0001;
 
