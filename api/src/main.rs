@@ -58,7 +58,7 @@ static PREBAKED: [&[u8]; 6] = [
 
 struct AppState;
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter("rinha_api=info")
@@ -69,7 +69,6 @@ async fn main() {
     let index_path = std::env::var("INDEX_PATH")
         .unwrap_or_else(|_| format!("{}/index.bin.gz", data_dir));
 
-    // Start loading index in background on blocking thread
     let idx = index_path.clone();
     tokio::task::spawn_blocking(move || {
         info!("Loading index from {}...", idx);
@@ -101,8 +100,6 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
-/// Returns 200 only after the index is fully loaded.
-/// Returns 503 during loading so nginx knows to retry elsewhere.
 async fn ready_handler() -> StatusCode {
     if READY.load(Ordering::Acquire) {
         StatusCode::OK
@@ -111,20 +108,18 @@ async fn ready_handler() -> StatusCode {
     }
 }
 
-async fn fraud_score(
-    body: Bytes,
-) -> Result<&'static [u8], StatusCode> {
-    // If index isn't loaded yet, return 503 immediately (fast path)
+async fn fraud_score(body: Bytes) -> Result<&'static [u8], StatusCode> {
     if !READY.load(Ordering::Acquire) {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
-
-    // OnceLock::get is lock-free after initialization
     let search = SEARCH.get().expect("Search not loaded but ready=true");
     let q = parse_body_fast(&body)?;
 
-    // Inline search on the single runtime thread (no spawn_blocking overhead)
-    let neighbors = search.search_with_probe(&q, 2);
+    let neighbors = tokio::task::spawn_blocking(move || {
+        search.search_with_probe(&q, 1)
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let fraud_count = neighbors.iter().filter(|r| r.label == 1).count();
     let n = neighbors.len().max(1);

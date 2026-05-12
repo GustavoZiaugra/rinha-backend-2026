@@ -14,11 +14,36 @@ pub struct VectorSearch {
     pub count: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct SearchResult {
     pub node_id: u32,
     pub distance: f32,
     pub label: u8,
+}
+
+pub struct Neighbors {
+    items: [SearchResult; 5],
+    len: usize,
+}
+
+impl Neighbors {
+    pub fn iter(&self) -> std::slice::Iter<'_, SearchResult> {
+        self.items[..self.len].iter()
+    }
+    pub fn len(&self) -> usize { self.len }
+}
+
+impl std::ops::Deref for Neighbors {
+    type Target = [SearchResult];
+    fn deref(&self) -> &Self::Target { &self.items[..self.len] }
+}
+
+impl<'a> IntoIterator for &'a Neighbors {
+    type Item = &'a SearchResult;
+    type IntoIter = std::slice::Iter<'a, SearchResult>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.items[..self.len].iter()
+    }
 }
 
 impl VectorSearch {
@@ -110,25 +135,31 @@ impl VectorSearch {
         }
     }
 
-    pub fn search(&self, query: &[f32; DIMS], _k: usize) -> Vec<SearchResult> {
+    pub fn search(&self, query: &[f32; DIMS], _k: usize) -> Neighbors {
         self.search_with_probe(query, 4)
     }
 
-    pub fn search_with_probe(&self, query: &[f32; DIMS], n_probe: usize) -> Vec<SearchResult> {
-        if self.count == 0 { return Vec::new(); }
-        let closest = find_closest_centroids(query, &self.centroids, self.k, n_probe);
-        self.search_clusters(query, &closest)
+    pub fn search_with_probe(&self, query: &[f32; DIMS], n_probe: usize) -> Neighbors {
+        if self.count == 0 {
+            return Neighbors { items: [SearchResult { node_id: 0, distance: 0.0, label: 0 }; 5], len: 0 };
+        }
+        let (closest, n_closest) = find_closest_centroids(query, &self.centroids, self.k, n_probe);
+        self.search_clusters(query, &closest[..n_closest])
     }
 
-    fn search_clusters(&self, query: &[f32; DIMS], clusters: &[usize]) -> Vec<SearchResult> {
+    fn search_clusters(&self, query: &[f32; DIMS], clusters: &[usize]) -> Neighbors {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        { self.search_simd(query, clusters) }
+        {
+            self.search_simd(query, clusters)
+        }
         #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-        { self.search_scalar(query, clusters) }
+        {
+            self.search_scalar(query, clusters)
+        }
     }
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    fn search_simd(&self, query: &[f32; DIMS], clusters: &[usize]) -> Vec<SearchResult> {
+    fn search_simd(&self, query: &[f32; DIMS], clusters: &[usize]) -> Neighbors {
         use std::arch::x86_64::*;
         let q_lo = unsafe { _mm256_set_ps(query[7], query[6], query[5], query[4], query[3], query[2], query[1], query[0]) };
         let q_hi = unsafe { _mm256_set_ps(0.0, 0.0, query[13], query[12], query[11], query[10], query[9], query[8]) };
@@ -160,11 +191,16 @@ impl VectorSearch {
 
         let mut order: [usize; 5] = [0, 1, 2, 3, 4];
         order.sort_by(|&a, &b| top[a].0.total_cmp(&top[b].0));
-        (0..filled).map(|i| { let (d, id, lb) = top[order[i]]; SearchResult { node_id: id, distance: d, label: lb } }).collect()
+        let mut items = [SearchResult { node_id: 0, distance: 0.0, label: 0 }; 5];
+        for i in 0..filled {
+            let (d, id, lb) = top[order[i]];
+            items[i] = SearchResult { node_id: id, distance: d, label: lb };
+        }
+        Neighbors { items, len: filled }
     }
 
     #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-    fn search_scalar(&self, query: &[f32; DIMS], clusters: &[usize]) -> Vec<SearchResult> {
+    fn search_scalar(&self, query: &[f32; DIMS], clusters: &[usize]) -> Neighbors {
         let mut top = [(f32::MAX, 0u32, 0u8); 5];
         let mut filled = 0usize;
         let mut widx = 0usize;
@@ -183,7 +219,12 @@ impl VectorSearch {
         }
         let mut order: [usize; 5] = [0, 1, 2, 3, 4];
         order.sort_by(|&a, &b| top[a].0.total_cmp(&top[b].0));
-        (0..filled).map(|i| { let (d, id, lb) = top[order[i]]; SearchResult { node_id: id, distance: d, label: lb } }).collect()
+        let mut items = [SearchResult { node_id: 0, distance: 0.0, label: 0 }; 5];
+        for i in 0..filled {
+            let (d, id, lb) = top[order[i]];
+            items[i] = SearchResult { node_id: id, distance: d, label: lb };
+        }
+        Neighbors { items, len: filled }
     }
 
     pub fn memory_usage(&self) -> usize {
@@ -191,7 +232,7 @@ impl VectorSearch {
     }
 }
 
-fn find_closest_centroids(query: &[f32; DIMS], centroids: &[u16], k: usize, n: usize) -> Vec<usize> {
+fn find_closest_centroids(query: &[f32; DIMS], centroids: &[u16], k: usize, n: usize) -> ([usize; 4], usize) {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     { find_closest_centroids_simd(query, centroids, k, n) }
     #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
@@ -199,7 +240,7 @@ fn find_closest_centroids(query: &[f32; DIMS], centroids: &[u16], k: usize, n: u
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-fn find_closest_centroids_simd(query: &[f32; DIMS], centroids: &[u16], k: usize, n: usize) -> Vec<usize> {
+fn find_closest_centroids_simd(query: &[f32; DIMS], centroids: &[u16], k: usize, n: usize) -> ([usize; 4], usize) {
     use std::arch::x86_64::*;
     let q_lo = unsafe { _mm256_set_ps(query[7], query[6], query[5], query[4], query[3], query[2], query[1], query[0]) };
     let q_hi = unsafe { _mm256_set_ps(0.0, 0.0, query[13], query[12], query[11], query[10], query[9], query[8]) };
@@ -209,11 +250,13 @@ fn find_closest_centroids_simd(query: &[f32; DIMS], centroids: &[u16], k: usize,
     let dists_slice = &mut dists[..k];
     if n < k { dists_slice.select_nth_unstable_by(n, |a, b| a.0.total_cmp(&b.0)); }
     dists_slice[..n].sort_by(|a, b| a.0.total_cmp(&b.0));
-    dists_slice[..n].iter().map(|&(_, c)| c).collect()
+    let mut out = [0usize; 4];
+    for i in 0..n { out[i] = dists_slice[i].1; }
+    (out, n)
 }
 
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-fn find_closest_centroids_scalar(query: &[f32; DIMS], centroids: &[u16], k: usize, n: usize) -> Vec<usize> {
+fn find_closest_centroids_scalar(query: &[f32; DIMS], centroids: &[u16], k: usize, n: usize) -> ([usize; 4], usize) {
     let mut dists = [(f32::MAX, 0usize); 512];
     for c in 0..k {
         let mut sum = 0.0f32;
@@ -223,7 +266,9 @@ fn find_closest_centroids_scalar(query: &[f32; DIMS], centroids: &[u16], k: usiz
     let dists_slice = &mut dists[..k];
     if n < k { dists_slice.select_nth_unstable_by(n, |a, b| a.0.total_cmp(&b.0)); }
     dists_slice[..n].sort_by(|a, b| a.0.total_cmp(&b.0));
-    dists_slice[..n].iter().map(|&(_, c)| c).collect()
+    let mut out = [0usize; 4];
+    for i in 0..n { out[i] = dists_slice[i].1; }
+    (out, n)
 }
 
 pub fn f16_to_f32(bits: u16) -> f32 { half::f16::from_bits(bits).to_f32() }
