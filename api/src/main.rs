@@ -57,7 +57,7 @@ struct AppState {
 
 type SharedState = Arc<AppState>;
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter("rinha_api=info")
@@ -69,12 +69,7 @@ async fn main() {
         .unwrap_or_else(|_| format!("{}/index.bin.gz", data_dir));
 
     info!("Loading index from {}...", index_path);
-    // Load index synchronously — fast (~1-2s for 18MB gz)
-    let search = tokio::task::spawn_blocking(move || {
-        rinha_core::vector::VectorSearch::load(&index_path)
-    })
-    .await
-    .expect("Index loading failed");
+    let search = rinha_core::vector::VectorSearch::load(&index_path);
 
     info!(
         "Index loaded in {:?}. ~{} MB, {} centroids, {} blocks, {} vectors",
@@ -107,14 +102,8 @@ async fn fraud_score(
 ) -> Result<&'static [u8], StatusCode> {
     let q = parse_body_fast(&body)?;
 
-    // Move the CPU-intensive search to the blocking thread pool
-    // so it doesn't starve tokio's async workers.
-    let search = state.search.clone();
-    let neighbors = tokio::task::spawn_blocking(move || {
-        search.search_with_probe(&q, 4)
-    })
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    // Single-threaded runtime: inline the search (no spawn_blocking overhead)
+    let neighbors = state.search.search_with_probe(&q, 2);
 
     let fraud_count = neighbors.iter().filter(|r| r.label == 1).count();
     let n = neighbors.len().max(1);
