@@ -1,44 +1,53 @@
+version: "3.8"
+
 services:
-  api-1:
+  api1:
     image: ttl.sh/rinha-gustavo-2026:24h
     environment:
-      - PORT=8080
-      - DATA_DIR=/app/data
+      - SOCK=/run/sock/api1.sock
+    volumes:
+      - sock:/run/sock
     deploy:
       resources:
         limits:
-          cpus: "0.49"
-          memory: "160MB"
-    expose:
-      - "8080"
-    restart: unless-stopped
+          cpus: "0.45"
+          memory: "160M"
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
 
-  api-2:
+  api2:
     image: ttl.sh/rinha-gustavo-2026:24h
     environment:
-      - PORT=8080
-      - DATA_DIR=/app/data
+      - SOCK=/run/sock/api2.sock
+    volumes:
+      - sock:/run/sock
     deploy:
       resources:
         limits:
-          cpus: "0.49"
-          memory: "160MB"
-    expose:
-      - "8080"
-    restart: unless-stopped
+          cpus: "0.45"
+          memory: "160M"
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
 
-  nginx:
-    image: nginx:alpine
-    depends_on:
-      - api-1
-      - api-2
+  lb:
+    image: haproxy:2.9-alpine
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - sock:/run/sock
     ports:
       - "9999:9999"
-    volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - api1
+      - api2
     deploy:
       resources:
         limits:
-          cpus: "0.02"
-          memory: "30MB"
-    restart: unless-stopped
+          cpus: "0.1"
+          memory: "30M"
+
+volumes:
+  sock:

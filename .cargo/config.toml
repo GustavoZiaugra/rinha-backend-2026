@@ -1,9 +1,2 @@
-[target.'cfg(all(target_arch = "x86_64", target_feature = "avx2"))']
-rustflags = ["-C", "target-cpu=native"]
-
-[profile.release]
-opt-level = 3
-lto = "fat"
-codegen-units = 1
-strip = "symbols"
-panic = "abort"
+[build]
+rustflags = ["-C", "target-cpu=haswell", "-C", "target-feature=+avx2,+fma,+f16c,+bmi2,+popcnt"]
