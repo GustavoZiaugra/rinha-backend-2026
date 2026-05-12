@@ -27,7 +27,7 @@ pub fn dataset() -> &'static Dataset {
 
 impl Dataset {
     fn load_embedded() -> Result<Self, Box<dyn std::error::Error>> {
-        static INDEX_GZ: &[u8] = include_bytes!("../data/index.bin.gz");
+        static INDEX_GZ: &[u8] = include_bytes!("../../data/index.bin.gz");
         let mut gz = GzDecoder::new(&INDEX_GZ[..]);
 
         let mut magic = [0u8; 4];

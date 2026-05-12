@@ -4,11 +4,11 @@ use crate::knn;
 use crate::vector;
 
 use std::io::{Read, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::net::{TcpListener, TcpStream};
 
 const RX_CAP: usize = 8192;
 
-pub fn serve(listener: UnixListener) -> std::io::Result<()> {
+pub fn serve(listener: TcpListener) -> std::io::Result<()> {
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
@@ -21,7 +21,7 @@ pub fn serve(listener: UnixListener) -> std::io::Result<()> {
     Ok(())
 }
 
-fn handle_conn(stream: &mut UnixStream) {
+fn handle_conn(stream: &mut TcpStream) {
     let mut buf = [0u8; RX_CAP];
     let mut used = 0usize;
 
