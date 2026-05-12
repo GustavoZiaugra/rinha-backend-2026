@@ -1,12 +1,13 @@
 use axum::body::Bytes;
 use axum::{
-    extract::State,
     http::StatusCode,
     routing::{get, post},
     Router,
 };
 use rinha_core::vector::VectorSearch;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use std::time::Instant;
 use tracing::info;
 
@@ -14,6 +15,10 @@ use mimalloc::MiMalloc;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
+
+// Global search — loaded once in background so server starts listening immediately
+static SEARCH: OnceLock<VectorSearch> = OnceLock::new();
+static READY: AtomicBool = AtomicBool::new(false);
 
 /// Fast MCC lookup without HashMap
 fn mcc_risk(mcc: &[u8]) -> f32 {
@@ -51,11 +56,7 @@ static PREBAKED: [&[u8]; 6] = [
     b"{\"approved\":false,\"fraud_score\":1.0}",
 ];
 
-struct AppState {
-    search: Arc<VectorSearch>,
-}
-
-type SharedState = Arc<AppState>;
+struct AppState;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -68,23 +69,27 @@ async fn main() {
     let index_path = std::env::var("INDEX_PATH")
         .unwrap_or_else(|_| format!("{}/index.bin.gz", data_dir));
 
-    info!("Loading index from {}...", index_path);
-    let search = rinha_core::vector::VectorSearch::load(&index_path);
+    // Start loading index in background on blocking thread
+    let idx = index_path.clone();
+    tokio::task::spawn_blocking(move || {
+        info!("Loading index from {}...", idx);
+        let search = rinha_core::vector::VectorSearch::load(&idx);
+        info!(
+            "Index loaded in {:?}. ~{} MB, {} centroids, {} blocks, {} vectors",
+            start.elapsed(),
+            search.memory_usage() / 1048576,
+            search.k,
+            search.total_blocks,
+            search.count,
+        );
+        let _ = SEARCH.set(search);
+        READY.store(true, Ordering::Release);
+        info!("Server is READY ({:?})", start.elapsed());
+    });
 
-    info!(
-        "Index loaded in {:?}. ~{} MB, {} centroids, {} blocks, {} vectors",
-        start.elapsed(),
-        search.memory_usage() / 1048576,
-        search.k,
-        search.total_blocks,
-        search.count,
-    );
-
-    info!("Startup complete: {:?}", start.elapsed());
-
-    let state = Arc::new(AppState { search: Arc::new(search) });
+    let state = Arc::new(AppState);
     let app = Router::new()
-        .route("/ready", get(|| async { StatusCode::OK }))
+        .route("/ready", get(ready_handler))
         .route("/fraud-score", post(fraud_score))
         .with_state(state);
 
@@ -96,14 +101,30 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
+/// Returns 200 only after the index is fully loaded.
+/// Returns 503 during loading so nginx knows to retry elsewhere.
+async fn ready_handler() -> StatusCode {
+    if READY.load(Ordering::Acquire) {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
 async fn fraud_score(
-    State(state): State<SharedState>,
     body: Bytes,
 ) -> Result<&'static [u8], StatusCode> {
+    // If index isn't loaded yet, return 503 immediately (fast path)
+    if !READY.load(Ordering::Acquire) {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // OnceLock::get is lock-free after initialization
+    let search = SEARCH.get().expect("Search not loaded but ready=true");
     let q = parse_body_fast(&body)?;
 
-    // Single-threaded runtime: inline the search (no spawn_blocking overhead)
-    let neighbors = state.search.search_with_probe(&q, 2);
+    // Inline search on the single runtime thread (no spawn_blocking overhead)
+    let neighbors = search.search_with_probe(&q, 2);
 
     let fraud_count = neighbors.iter().filter(|r| r.label == 1).count();
     let n = neighbors.len().max(1);
@@ -163,16 +184,10 @@ impl<'a> Parser<'a> {
     }
 
     fn peek(&self) -> u8 {
-        if self.pos < self.s.len() {
-            self.s[self.pos]
-        } else {
-            0
-        }
+        if self.pos < self.s.len() { self.s[self.pos] } else { 0 }
     }
 
-    fn advance(&mut self) {
-        self.pos += 1;
-    }
+    fn advance(&mut self) { self.pos += 1; }
 
     fn skip_ws(&mut self) {
         while self.pos < self.s.len() && self.s[self.pos].is_ascii_whitespace() {
@@ -192,18 +207,12 @@ impl<'a> Parser<'a> {
 
     fn read_string(&mut self) -> &'a [u8] {
         self.skip_ws();
-        if self.pos >= self.s.len() || self.s[self.pos] != b'"' {
-            return b"";
-        }
+        if self.pos >= self.s.len() || self.s[self.pos] != b'"' { return b""; }
         self.pos += 1;
         let start = self.pos;
-        while self.pos < self.s.len() && self.s[self.pos] != b'"' {
-            self.pos += 1;
-        }
+        while self.pos < self.s.len() && self.s[self.pos] != b'"' { self.pos += 1; }
         let result = &self.s[start..self.pos];
-        if self.pos < self.s.len() {
-            self.pos += 1;
-        }
+        if self.pos < self.s.len() { self.pos += 1; }
         result
     }
 
@@ -217,56 +226,36 @@ impl<'a> Parser<'a> {
                 || self.s[self.pos] == b'+'
                 || self.s[self.pos] == b'e'
                 || self.s[self.pos] == b'E')
-        {
-            self.pos += 1;
-        }
+        { self.pos += 1; }
         if self.pos > start {
             let slice = unsafe { std::str::from_utf8_unchecked(&self.s[start..self.pos]) };
             slice.parse::<f32>().unwrap_or(0.0)
-        } else {
-            0.0
-        }
+        } else { 0.0 }
     }
 
-    fn read_int(&mut self) -> i32 {
-        self.read_number() as i32
-    }
+    fn read_int(&mut self) -> i32 { self.read_number() as i32 }
 
     fn read_bool(&mut self) -> bool {
         self.skip_ws();
         if self.pos + 4 <= self.s.len() && &self.s[self.pos..self.pos + 4] == b"true" {
-            self.pos += 4;
-            true
+            self.pos += 4; true
         } else if self.pos + 5 <= self.s.len() && &self.s[self.pos..self.pos + 5] == b"false" {
-            self.pos += 5;
-            false
-        } else {
-            false
-        }
+            self.pos += 5; false
+        } else { false }
     }
 
     fn read_null(&mut self) {
         self.skip_ws();
-        if self.pos + 4 <= self.s.len() && &self.s[self.pos..self.pos + 4] == b"null" {
-            self.pos += 4;
-        }
+        if self.pos + 4 <= self.s.len() && &self.s[self.pos..self.pos + 4] == b"null" { self.pos += 4; }
     }
 
     fn skip_value(&mut self) {
         self.skip_ws();
-        if self.pos >= self.s.len() {
-            return;
-        }
+        if self.pos >= self.s.len() { return; }
         match self.s[self.pos] {
-            b'"' => {
-                self.read_string();
-            }
-            b't' | b'f' => {
-                self.read_bool();
-            }
-            b'n' => {
-                self.read_null();
-            }
+            b'"' => { self.read_string(); }
+            b't' | b'f' => { self.read_bool(); }
+            b'n' => { self.read_null(); }
             b'[' => {
                 self.pos += 1;
                 let mut depth = 1;
@@ -274,10 +263,7 @@ impl<'a> Parser<'a> {
                     match self.s[self.pos] {
                         b'[' => depth += 1,
                         b']' => depth -= 1,
-                        b'"' => {
-                            self.read_string();
-                            continue;
-                        }
+                        b'"' => { self.read_string(); continue; }
                         _ => {}
                     }
                     self.pos += 1;
@@ -290,10 +276,7 @@ impl<'a> Parser<'a> {
                     match self.s[self.pos] {
                         b'{' => depth += 1,
                         b'}' => depth -= 1,
-                        b'"' => {
-                            self.read_string();
-                            continue;
-                        }
+                        b'"' => { self.read_string(); continue; }
                         _ => {}
                     }
                     self.pos += 1;
@@ -307,36 +290,25 @@ impl<'a> Parser<'a> {
                         || self.s[self.pos] == b'+'
                         || self.s[self.pos] == b'e'
                         || self.s[self.pos] == b'E')
-                {
-                    self.pos += 1;
-                }
+                { self.pos += 1; }
             }
         }
     }
 
-    fn read_key(&mut self) -> &'a [u8] {
-        self.read_string()
-    }
+    fn read_key(&mut self) -> &'a [u8] { self.read_string() }
 
     fn expect_colon(&mut self) {
         self.skip_ws();
-        if self.pos < self.s.len() && self.s[self.pos] == b':' {
-            self.pos += 1;
-        }
+        if self.pos < self.s.len() && self.s[self.pos] == b':' { self.pos += 1; }
         self.skip_ws();
     }
 
     fn parse_all(&mut self) {
-        if !self.expect(b'{') {
-            return;
-        }
+        if !self.expect(b'{') { return; }
         while self.pos < self.s.len() {
             self.skip_ws();
             match self.peek() {
-                b'}' => {
-                    self.advance();
-                    break;
-                }
+                b'}' => { self.advance(); break; }
                 b'"' => {
                     let key = self.read_key();
                     self.expect_colon();
@@ -348,13 +320,8 @@ impl<'a> Parser<'a> {
                         b"terminal" => self.parse_term(),
                         b"last_transaction" => {
                             self.skip_ws();
-                            if self.peek() == b'n' {
-                                self.read_null();
-                                self.has_last = false;
-                            } else {
-                                self.has_last = true;
-                                self.parse_last();
-                            }
+                            if self.peek() == b'n' { self.read_null(); self.has_last = false; }
+                            else { self.has_last = true; self.parse_last(); }
                         }
                         _ => self.skip_value(),
                     }
@@ -370,8 +337,7 @@ impl<'a> Parser<'a> {
         while self.pos < self.s.len() {
             self.skip_ws();
             if self.peek() == b'}' { self.advance(); break; }
-            let key = self.read_key();
-            self.expect_colon();
+            let key = self.read_key(); self.expect_colon();
             match key {
                 b"amount" => self.tx_amount = self.read_number(),
                 b"installments" => self.tx_installments = self.read_int(),
@@ -387,23 +353,16 @@ impl<'a> Parser<'a> {
         while self.pos < self.s.len() {
             self.skip_ws();
             if self.peek() == b'}' { self.advance(); break; }
-            let key = self.read_key();
-            self.expect_colon();
+            let key = self.read_key(); self.expect_colon();
             match key {
                 b"avg_amount" => self.cust_avg_amount = self.read_number(),
                 b"tx_count_24h" => self.cust_tx_count = self.read_int(),
                 b"known_merchants" => {
                     if self.expect(b'[') {
                         self.known_count = 0;
-                        while self.pos < self.s.len()
-                            && self.peek() != b']'
-                            && self.known_count < 20
-                        {
+                        while self.pos < self.s.len() && self.peek() != b']' && self.known_count < 20 {
                             let m = self.read_string();
-                            if !m.is_empty() {
-                                self.known_merchants[self.known_count] = m;
-                                self.known_count += 1;
-                            }
+                            if !m.is_empty() { self.known_merchants[self.known_count] = m; self.known_count += 1; }
                             self.expect(b',');
                         }
                         self.expect(b']');
@@ -420,8 +379,7 @@ impl<'a> Parser<'a> {
         while self.pos < self.s.len() {
             self.skip_ws();
             if self.peek() == b'}' { self.advance(); break; }
-            let key = self.read_key();
-            self.expect_colon();
+            let key = self.read_key(); self.expect_colon();
             match key {
                 b"id" => self.merch_id = self.read_string(),
                 b"mcc" => self.merch_mcc = self.read_string(),
@@ -437,8 +395,7 @@ impl<'a> Parser<'a> {
         while self.pos < self.s.len() {
             self.skip_ws();
             if self.peek() == b'}' { self.advance(); break; }
-            let key = self.read_key();
-            self.expect_colon();
+            let key = self.read_key(); self.expect_colon();
             match key {
                 b"is_online" => self.term_online = self.read_bool(),
                 b"card_present" => self.term_card_present = self.read_bool(),
@@ -454,8 +411,7 @@ impl<'a> Parser<'a> {
         while self.pos < self.s.len() {
             self.skip_ws();
             if self.peek() == b'}' { self.advance(); break; }
-            let key = self.read_key();
-            self.expect_colon();
+            let key = self.read_key(); self.expect_colon();
             match key {
                 b"timestamp" => self.last_ts = self.read_string(),
                 b"km_from_current" => self.last_km = self.read_number(),
@@ -478,18 +434,12 @@ impl<'a> Parser<'a> {
             let minutes = minutes_between_raw(self.last_ts, self.tx_requested_at).max(0) as f32;
             q[5] = (minutes / MAX_MINUTES).clamp(0.0, 1.0);
             q[6] = (self.last_km / MAX_KM).clamp(0.0, 1.0);
-        } else {
-            q[5] = -1.0;
-            q[6] = -1.0;
-        }
+        } else { q[5] = -1.0; q[6] = -1.0; }
         q[7] = (self.term_km / MAX_KM).clamp(0.0, 1.0);
         q[8] = (self.cust_tx_count as f32 / MAX_TX_COUNT).clamp(0.0, 1.0);
         q[9] = if self.term_online { 1.0 } else { 0.0 };
         q[10] = if self.term_card_present { 1.0 } else { 0.0 };
-        q[11] = if self.known_merchants[..self.known_count]
-            .iter()
-            .any(|m| *m == self.merch_id)
-        { 0.0 } else { 1.0 };
+        q[11] = if self.known_merchants[..self.known_count].iter().any(|m| *m == self.merch_id) { 0.0 } else { 1.0 };
         q[12] = mcc_risk(self.merch_mcc);
         q[13] = (self.merch_avg_amount / MAX_MERCHANT_AVG).clamp(0.0, 1.0);
         q
@@ -533,7 +483,7 @@ mod tests {
         assert!((q[2] - 1.0).abs() < 0.001, "dim2: {}", q[2]);
         assert!((q[7] - 0.9523).abs() < 0.001, "dim7: {}", q[7]);
         assert!((q[8] - 1.0).abs() < 0.001, "dim8: {}", q[8]);
-        assert!((q[12] - 0.75).abs() < 0.001, "dim12: {}", q[12]);
+        assert!((q[12] - 0.75).abs() < 0.001, "dim12": {}, q[12]);
     }
 }
 
