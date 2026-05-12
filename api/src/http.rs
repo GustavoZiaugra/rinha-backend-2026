@@ -13,7 +13,9 @@ pub fn serve(listener: TcpListener) -> std::io::Result<()> {
         match stream {
             Ok(mut stream) => {
                 let _ = stream.set_nonblocking(false);
-                handle_conn(&mut stream);
+                std::thread::spawn(move || {
+                    handle_conn(&mut stream);
+                });
             }
             Err(_) => continue,
         }
