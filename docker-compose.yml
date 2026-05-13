@@ -1,8 +1,10 @@
 services:
   api1:
-    image: ttl.sh/rinha-gustavo-2026:v48
+    image: ttl.sh/rinha-gustavo-2026:v49
     environment:
-      - BIND=0.0.0.0:8080
+      - SOCK=/sockets/api1.sock
+    volumes:
+      - sockets:/sockets
     deploy:
       resources:
         limits:
@@ -14,9 +16,11 @@ services:
         hard: 65535
 
   api2:
-    image: ttl.sh/rinha-gustavo-2026:v48
+    image: ttl.sh/rinha-gustavo-2026:v49
     environment:
-      - BIND=0.0.0.0:8080
+      - SOCK=/sockets/api2.sock
+    volumes:
+      - sockets:/sockets
     deploy:
       resources:
         limits:
@@ -28,11 +32,10 @@ services:
         hard: 65535
 
   lb:
-    image: ttl.sh/rinha-gustavo-2026:v48
-    command: ["/lb"]
-    environment:
-      - PORT=9999
-      - UPSTREAMS=api1:8080,api2:8080
+    image: haproxy:alpine
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - sockets:/sockets:ro
     ports:
       - "9999:9999"
     depends_on:
@@ -43,3 +46,6 @@ services:
         limits:
           cpus: "0.1"
           memory: "30M"
+
+volumes:
+  sockets:
