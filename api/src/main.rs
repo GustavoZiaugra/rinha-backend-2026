@@ -5,14 +5,12 @@ mod json_utils;
 mod knn;
 mod vector;
 
-use libc;
-use mimalloc::MiMalloc;
-use std::net::TcpListener;
+use std::fs;
 use std::os::unix::io::FromRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 static READY: AtomicBool = AtomicBool::new(false);
 
@@ -21,43 +19,53 @@ pub fn is_ready() -> bool {
 }
 
 fn main() {
-    // Create a TCP socket with a large listen backlog (16384)
-    // to handle many concurrent connections without rejections.
+    let sock_path = std::env::var("SOCK").unwrap_or_else(|_| "/run/api.sock".to_string());
+
+    // Remove stale socket file if present
+    let _ = fs::remove_file(&sock_path);
+
+    // Create a Unix Domain Socket with a large listen backlog
     let listener = unsafe {
-        let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+        let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
         if fd < 0 {
-            panic!("socket failed");
+            panic!("socket failed: {}", std::io::Error::last_os_error());
         }
-        let opt: i32 = 1;
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_REUSEADDR,
-            &opt as *const _ as *const libc::c_void,
-            std::mem::size_of::<i32>() as libc::socklen_t,
-        );
-        let addr: libc::sockaddr_in = {
-            let mut a: libc::sockaddr_in = std::mem::zeroed();
-            a.sin_family = libc::AF_INET as libc::sa_family_t;
-            a.sin_port = 8080u16.to_be();
-            a.sin_addr = libc::in_addr {
-                s_addr: 0u32, // INADDR_ANY
-            };
-            a
-        };
+
+        let mut addr: libc::sockaddr_un = std::mem::zeroed();
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+
+        // Copy path into sun_path (null-terminated) via raw pointer
+        // sun_path is [i8; 108] on Linux, we need to write u8 bytes into it
+        let bytes = sock_path.as_bytes();
+        let len = bytes.len().min(107);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                addr.sun_path.as_mut_ptr() as *mut u8,
+                len,
+            );
+            *addr.sun_path.as_mut_ptr().add(len) = 0;
+        }
+
+        let addr_len = std::mem::size_of::<libc::sa_family_t>() + len + 1;
         let ret = libc::bind(
             fd,
             &addr as *const _ as *const libc::sockaddr,
-            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            addr_len as libc::socklen_t,
         );
         if ret < 0 {
             panic!("bind failed: {}", std::io::Error::last_os_error());
         }
+
         libc::listen(fd, 16384);
-        TcpListener::from_raw_fd(fd)
+
+        // Set permissions so HAProxy can connect
+        libc::chmod(sock_path.as_ptr() as *const libc::c_char, 0o777);
+
+        std::os::unix::net::UnixListener::from_raw_fd(fd)
     };
 
-    // Initialize dataset and mark ready immediately
+    // Initialize dataset in background
     std::thread::spawn(move || {
         data::init();
         READY.store(true, Ordering::Relaxed);

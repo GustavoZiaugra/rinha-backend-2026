@@ -5,19 +5,18 @@ use crate::vector;
 
 use memchr::memmem;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const RX_CAP: usize = 8192;
 
-/// Thread pool worker count — 12 threads for better throughput with low contention
+/// Thread pool worker count
 const WORKERS: usize = 4;
 
 /// Flag to signal workers to shut down
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
-pub fn serve(listener: TcpListener) -> std::io::Result<()> {
-    // Spawn N worker threads, each accepting from the shared listener.
+pub fn serve(listener: UnixListener) -> std::io::Result<()> {
     let listener = std::sync::Arc::new(listener);
 
     let mut handles = Vec::with_capacity(WORKERS);
@@ -34,7 +33,7 @@ pub fn serve(listener: TcpListener) -> std::io::Result<()> {
     Ok(())
 }
 
-fn worker(listener: &TcpListener) {
+fn worker(listener: &UnixListener) {
     loop {
         if SHUTDOWN.load(Ordering::Relaxed) {
             break;
@@ -52,10 +51,10 @@ fn worker(listener: &TcpListener) {
 }
 
 /// Handle a single HTTP request, then close the connection.
-/// No keep-alive — each TCP connection handles exactly one request.
+/// No keep-alive — each connection handles exactly one request.
 /// This prevents worker threads from being tied up waiting for
 /// the next request on an idle keepalive connection.
-fn handle_conn(stream: &mut TcpStream) {
+fn handle_conn(stream: &mut (impl Read + Write)) {
     let mut buf = [0u8; RX_CAP];
     let mut used = 0usize;
 
@@ -155,7 +154,7 @@ fn parse_content_length(headers: &[u8]) -> Option<usize> {
     Some(v)
 }
 
-/// All responses include Connection: close so each TCP connection
+/// All responses include Connection: close so each connection
 /// handles exactly one request. This prevents worker threads from
 /// blocking on idle keepalive connections.
 pub const HTTP_FRAUD: [&[u8]; 6] = [
