@@ -1,0 +1,8 @@
+# Local build: copy pre-compiled binaries
+FROM scratch
+COPY target/release/api /api
+COPY target/release/lb /lb
+COPY data/index.bin.gz /data/index.bin.gz
+ENV BIND=0.0.0.0:8080
+EXPOSE 8080
+CMD ["/api"]
