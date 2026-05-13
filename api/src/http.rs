@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 const RX_CAP: usize = 8192;
 
-/// Thread pool worker count
-const WORKERS: usize = 4;
+/// Thread pool worker count (16 = good throughput under 0.45 CPU, I/O-bound workers share CPU)
+const WORKERS: usize = 16;
 
 /// Flag to signal workers to shut down
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
