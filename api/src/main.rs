@@ -24,10 +24,9 @@ fn main() {
 
     let listener = TcpListener::bind(&bind_addr).expect("bind TCP");
 
-    // Initialize dataset and warmup in background so we can start serving right away
+    // Initialize dataset and mark ready immediately
     std::thread::spawn(move || {
         data::init();
-        knn::warmup();
         READY.store(true, Ordering::Relaxed);
     });
 

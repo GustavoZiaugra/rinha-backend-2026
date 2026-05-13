@@ -1,33 +1,14 @@
-use crate::data::{self, Dataset};
+use crate::data::Dataset;
 use std::arch::x86_64::*;
 use std::mem::MaybeUninit;
 
-const FULL_NPROBE: usize = 50;
+const FULL_NPROBE: usize = 10;
 const MAX_CENTROIDS: usize = 4096;
 const VECTOR_SCALE: f32 = 0.0001;
 const KNN_K: usize = 7;
 
 pub fn knn5_fraud_count(query: &[f32; 14], ds: &Dataset) -> u8 {
     unsafe { knn5_ivf(query, ds) }
-}
-
-pub fn warmup() {
-    let ds = data::dataset();
-    let mut sink: u64 = 0;
-    for v in ds.centroids.iter() {
-        sink ^= v.to_bits() as u64;
-    }
-    let _ = sink;
-
-    let mut state = 0x12345678u32;
-    for _ in 0..500 {
-        let mut q = [0.0f32; 14];
-        for v in q.iter_mut() {
-            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
-            *v = (state >> 8) as f32 / (1u32 << 24) as f32;
-        }
-        let _ = knn5_fraud_count(&q, ds);
-    }
 }
 
 #[target_feature(enable = "avx2,fma")]

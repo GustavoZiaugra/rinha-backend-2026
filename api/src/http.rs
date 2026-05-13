@@ -10,50 +10,51 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 const RX_CAP: usize = 8192;
 
-/// Thread pool worker count (50 = all bot connections served simultaneously, no accept queue wait)
-const WORKERS: usize = 50;
+/// Thread pool worker count — increased to handle more concurrent connections
+const WORKERS: usize = 250;
 
 /// Flag to signal workers to shut down
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 pub fn serve(listener: TcpListener) -> std::io::Result<()> {
     // Spawn N worker threads, each accepting from the shared listener.
-    // This avoids the overhead of spawning one thread per connection.
     let listener = std::sync::Arc::new(listener);
 
     let mut handles = Vec::with_capacity(WORKERS);
-    for id in 0..WORKERS {
+    for _ in 0..WORKERS {
         let l = listener.clone();
         handles.push(std::thread::spawn(move || {
-            worker(id, &l);
+            worker(&l);
         }));
     }
 
-    // Wait for all workers to finish (shouldn't happen in normal operation)
     for h in handles {
         let _ = h.join();
     }
     Ok(())
 }
 
-fn worker(id: usize, listener: &TcpListener) {
+fn worker(listener: &TcpListener) {
     loop {
         if SHUTDOWN.load(Ordering::Relaxed) {
             break;
         }
         match listener.accept() {
-            Ok((mut stream, addr)) => {
+            Ok((mut stream, _addr)) => {
                 let _ = stream.set_nonblocking(false);
                 handle_conn(&mut stream);
             }
             Err(_) => {
-                // On accept error, briefly yield so we don't spin
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
         }
     }
 }
 
+/// Handle a single HTTP request, then close the connection.
+/// No keep-alive — each TCP connection handles exactly one request.
+/// This prevents worker threads from being tied up waiting for
+/// the next request on an idle keepalive connection.
 fn handle_conn(stream: &mut TcpStream) {
     let mut buf = [0u8; RX_CAP];
     let mut used = 0usize;
@@ -80,7 +81,6 @@ fn handle_conn(stream: &mut TcpStream) {
         };
 
         let content_len = parse_content_length(&buf[..header_end]).unwrap_or(0);
-
         let total_len = header_end + 4 + content_len;
         if used < total_len {
             continue;
@@ -91,19 +91,8 @@ fn handle_conn(stream: &mut TcpStream) {
         let resp = handle_request(path, body);
         let _ = stream.write_all(resp);
 
-        // Check if keep-alive
-        let is_keepalive = is_keepalive(&buf[..header_end]);
-        if !is_keepalive {
-            break;
-        }
-
-        // Shift remaining data
-        if used > total_len {
-            buf.copy_within(total_len..used, 0);
-            used -= total_len;
-        } else {
-            used = 0;
-        }
+        // Always close after one request — no keepalive
+        break;
     }
 }
 
@@ -132,7 +121,6 @@ fn memmem_find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 fn parse_path(headers: &[u8]) -> &[u8] {
-    // headers starts with "METHOD PATH HTTP/1.1\r\n..."
     let mut i = 0;
     while i < headers.len() && headers[i] != b' ' {
         i += 1;
@@ -140,7 +128,7 @@ fn parse_path(headers: &[u8]) -> &[u8] {
     if i >= headers.len() {
         return &[];
     }
-    i += 1; // skip space
+    i += 1;
     let start = i;
     while i < headers.len() && headers[i] != b' ' {
         i += 1;
@@ -149,7 +137,6 @@ fn parse_path(headers: &[u8]) -> &[u8] {
 }
 
 fn parse_content_length(headers: &[u8]) -> Option<usize> {
-    // Try lowercase first, then title-case
     const CL_LOWER: &[u8] = b"content-length:";
     const CL_TITLE: &[u8] = b"Content-Length:";
     let start = memmem::find(headers, CL_LOWER)
@@ -166,36 +153,19 @@ fn parse_content_length(headers: &[u8]) -> Option<usize> {
     Some(v)
 }
 
-fn is_keepalive(headers: &[u8]) -> bool {
-    const CONN: &[u8] = b"connection:";
-    const CONN_T: &[u8] = b"Connection:";
-    if let Some(start) = memmem::find(headers, CONN)
-        .or_else(|| memmem::find(headers, CONN_T))
-    {
-        let mut p = start + 10;
-        while p < headers.len() && headers[p].is_ascii_whitespace() {
-            p += 1;
-        }
-        let start = p;
-        while p < headers.len() && !headers[p].is_ascii_whitespace() && headers[p] != b'\r' {
-            p += 1;
-        }
-        let val = &headers[start..p];
-        return val.eq_ignore_ascii_case(b"keep-alive");
-    }
-    true // HTTP/1.1 defaults to keep-alive
-}
-
+/// All responses include Connection: close so each TCP connection
+/// handles exactly one request. This prevents worker threads from
+/// blocking on idle keepalive connections.
 pub const HTTP_FRAUD: [&[u8]; 6] = [
-    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 35\r\n\r\n{\"approved\":true,\"fraud_score\":0.0}",
-    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 35\r\n\r\n{\"approved\":true,\"fraud_score\":0.2}",
-    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 35\r\n\r\n{\"approved\":true,\"fraud_score\":0.4}",
-    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 36\r\n\r\n{\"approved\":false,\"fraud_score\":0.6}",
-    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 36\r\n\r\n{\"approved\":false,\"fraud_score\":0.8}",
-    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 36\r\n\r\n{\"approved\":false,\"fraud_score\":1.0}",
+    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 35\r\nConnection: close\r\n\r\n{\"approved\":true,\"fraud_score\":0.0}",
+    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 35\r\nConnection: close\r\n\r\n{\"approved\":true,\"fraud_score\":0.2}",
+    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 35\r\nConnection: close\r\n\r\n{\"approved\":true,\"fraud_score\":0.4}",
+    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 36\r\nConnection: close\r\n\r\n{\"approved\":false,\"fraud_score\":0.6}",
+    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 36\r\nConnection: close\r\n\r\n{\"approved\":false,\"fraud_score\":0.8}",
+    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 36\r\nConnection: close\r\n\r\n{\"approved\":false,\"fraud_score\":1.0}",
 ];
 
-pub const RESP_READY: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
-pub const RESP_NOT_FOUND: &[u8] = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+pub const RESP_READY: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+pub const RESP_NOT_FOUND: &[u8] = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 pub const RESP_BAD: &[u8] = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 pub const RESP_NOT_READY: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
