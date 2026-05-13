@@ -1,0 +1,11 @@
+# Use pre-built host binaries (glibc-based) for faster iteration
+FROM debian:stable-slim AS runtime
+
+# Copy the pre-built binaries from the host
+COPY target/release/api /api
+COPY target/release/lb /lb
+COPY data/index.bin.gz /data/index.bin.gz
+
+ENV BIND=0.0.0.0:8080
+EXPOSE 8080
+CMD ["/api"]
