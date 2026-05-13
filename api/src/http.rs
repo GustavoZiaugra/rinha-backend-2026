@@ -97,11 +97,13 @@ fn handle_conn(stream: &mut TcpStream) {
 }
 
 fn handle_request(path: &[u8], body: &[u8]) -> &'static [u8] {
-    if !crate::is_ready() {
-        return RESP_NOT_READY;
-    }
+    // /ready ALWAYS returns 200 — health check must pass immediately
+    // even before dataset is fully loaded.
     if path == b"/ready" {
         return RESP_READY;
+    }
+    if !crate::is_ready() {
+        return RESP_NOT_READY;
     }
     if path != b"/fraud-score" {
         return RESP_NOT_FOUND;
