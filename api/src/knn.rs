@@ -135,14 +135,22 @@ unsafe fn scan_and_count(probes: &[usize], ds: &Dataset, q_i16: &[i16; 14]) -> u
             let block_ptr = blocks.add(bi * block_stride);
             let mut dists8 = [0u64; 8];
 
-            for d in 0..14usize {
-                let qv = _mm256_set1_epi32(q_i16[d] as i32);
-                let vals = _mm_loadu_si128(block_ptr.add(d * 8) as *const __m128i);
-                let ve = _mm256_cvtepi16_epi32(vals);
-                let diff = _mm256_sub_epi32(ve, qv);
-                let sq = _mm256_mullo_epi32(diff, diff);
-                let lo = _mm256_extracti128_si256(sq, 0);
-                let hi = _mm256_extracti128_si256(sq, 1);
+            // Process 2 dimensions at once using _mm256_madd_epi16.
+            // madd multiplies 16-bit pairs and adds adjacent pairs into 32-bit results.
+            // For each d, d+1 pair: result[v] = (block[d][v]-q[d])^2 + (block[d+1][v]-q[d+1])^2
+            // This halves loop iterations (7 instead of 14) and uses 256-bit loads.
+            for d in (0..14usize).step_by(2) {
+                // Load block[d][0..7] and block[d+1][0..7] as 16 x i16 in one 256-bit load
+                let vals = _mm256_loadu_si256(block_ptr.add(d * 8) as *const __m256i);
+                // Broadcast q[d] in low 128-bit lane, q[d+1] in high 128-bit lane
+                let q_low = _mm_set1_epi16(q_i16[d]);
+                let q_high = _mm_set1_epi16(q_i16[d + 1]);
+                let qv = _mm256_set_m128i(q_high, q_low);
+                let diff = _mm256_sub_epi16(vals, qv);
+                // madd: 8 x i32 results, each = square-sum for 2 dimensions per vector
+                let sq_pair = _mm256_madd_epi16(diff, diff);
+                let lo = _mm256_extracti128_si256(sq_pair, 0);
+                let hi = _mm256_extracti128_si256(sq_pair, 1);
                 let arr = std::mem::transmute::<__m128i, [u32; 4]>(lo);
                 dists8[0] += arr[0] as u64;
                 dists8[1] += arr[1] as u64;
