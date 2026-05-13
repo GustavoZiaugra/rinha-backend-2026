@@ -5,7 +5,7 @@ use std::mem::MaybeUninit;
 const FULL_NPROBE: usize = 5;
 const MAX_CENTROIDS: usize = 4096;
 const VECTOR_SCALE: f32 = 0.0001;
-const KNN_K: usize = 5;
+const KNN_K: usize = 3;
 
 pub fn knn5_fraud_count(query: &[f32; 14], ds: &Dataset) -> u8 {
     unsafe { knn5_ivf(query, ds) }
