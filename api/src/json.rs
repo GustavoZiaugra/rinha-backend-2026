@@ -40,6 +40,12 @@ pub fn parse(buf: &[u8]) -> Option<VecPayload> {
     let mut merchant_id_buf = [0u8; 64];
     let mut merchant_id_len = 0usize;
 
+    // Collect known_merchant IDs separately because merchant.id appears AFTER customer.known_merchants
+    // in the JSON payload. We store them here and match against merchant_id after all parsing.
+    let mut known_ids: [[u8; 64]; 10] = [[0; 64]; 10];
+    let mut known_lens: [usize; 10] = [0; 10];
+    let mut known_count = 0usize;
+
     // Track which top-level fields we've encountered
     let mut in_transaction = false;
     let mut in_customer = false;
@@ -48,7 +54,6 @@ pub fn parse(buf: &[u8]) -> Option<VecPayload> {
     let mut in_last_tx = false;
     let mut in_known_merchants = false;
     let mut encountered_known_merchants = false;
-    let mut known_merchant_found = false;
 
     loop {
         skip_ws(buf, &mut pos);
@@ -113,8 +118,13 @@ pub fn parse(buf: &[u8]) -> Option<VecPayload> {
                         if buf[pos] == b']' { pos += 1; break; }
                         if buf[pos] == b',' { pos += 1; continue; }
                         let s = parse_string_raw(buf, &mut pos)?;
-                        if s == &merchant_id_buf[..merchant_id_len] {
-                            known_merchant_found = true;
+                        // Collect known_merchant IDs for post-parse matching
+                        // (merchant.id appears later in the JSON payload)
+                        if known_count < 10 {
+                            let len = s.len().min(64);
+                            known_ids[known_count][..len].copy_from_slice(&s[..len]);
+                            known_lens[known_count] = len;
+                            known_count += 1;
                         }
                     }
                     in_known_merchants = false;
@@ -210,7 +220,19 @@ pub fn parse(buf: &[u8]) -> Option<VecPayload> {
         );
     }
 
-    // known_merchant: if we encountered the array and merchant wasn't found, it's unknown
+    // Match merchant_id against known_merchants collected earlier
+    // (merchant section is parsed AFTER customer, so now merchant_id is available)
+    let mut known_merchant_found = false;
+    if encountered_known_merchants && merchant_id_len > 0 {
+        for i in 0..known_count {
+            if known_lens[i] == merchant_id_len
+                && &known_ids[i][..known_lens[i]] == &merchant_id_buf[..merchant_id_len]
+            {
+                known_merchant_found = true;
+                break;
+            }
+        }
+    }
     is_unknown_merchant = encountered_known_merchants && !known_merchant_found;
 
     Some(VecPayload {
