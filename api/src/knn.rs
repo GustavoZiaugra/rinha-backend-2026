@@ -2,10 +2,10 @@ use crate::data::{self, Dataset};
 use std::arch::x86_64::*;
 use std::mem::MaybeUninit;
 
-const FAST_NPROBE: usize = 5;
-const FULL_NPROBE: usize = 24;
+const FULL_NPROBE: usize = 100;
 const MAX_CENTROIDS: usize = 4096;
 const VECTOR_SCALE: f32 = 0.0001;
+const KNN_K: usize = 7;
 
 pub fn knn5_fraud_count(query: &[f32; 14], ds: &Dataset) -> u8 {
     unsafe { knn5_ivf(query, ds) }
@@ -40,15 +40,8 @@ unsafe fn knn5_ivf(query: &[f32; 14], ds: &Dataset) -> u8 {
         q_i16[d] = (query[d] / VECTOR_SCALE).round() as i16;
     }
 
-    let fast_probes = top_n_from_dists::<FAST_NPROBE>(&dists, ds.k);
-    let fast = scan_and_count(&fast_probes, ds, &q_i16);
-
-    if fast != 2 && fast != 3 {
-        return fast;
-    }
-
-    let full_probes = top_n_from_dists::<FULL_NPROBE>(&dists, ds.k);
-    scan_and_count(&full_probes, ds, &q_i16)
+    let probes = top_n_from_dists::<FULL_NPROBE>(&dists, ds.k);
+    scan_and_count(&probes, ds, &q_i16)
 }
 
 #[target_feature(enable = "avx2,fma")]
@@ -142,10 +135,10 @@ unsafe fn top_n_from_dists<const N: usize>(
 
 #[target_feature(enable = "avx2,fma")]
 unsafe fn scan_and_count(probes: &[usize], ds: &Dataset, q_i16: &[i16; 14]) -> u8 {
-    // Keep top-5 nearest neighbors
-    let mut best_d = [f32::MAX; 5];
-    let mut best_id = [0u32; 5];
-    let mut best_label = [0u8; 5];
+    // Keep top-KNN_K nearest neighbors
+    let mut best_d = [f32::MAX; KNN_K];
+    let mut best_id = [0u32; KNN_K];
+    let mut best_label = [0u8; KNN_K];
 
     for &ci in probes {
         let start = ds.offsets[ci] as usize;
@@ -188,12 +181,12 @@ unsafe fn scan_and_count(probes: &[usize], ds: &Dataset, q_i16: &[i16; 14]) -> u
                 }
                 let d = (dists8[v] as f32) * VECTOR_SCALE * VECTOR_SCALE;
 
-                // Insert into top-5
-                if d < best_d[4] {
-                    best_d[4] = d;
-                    best_id[4] = global_idx as u32;
-                    best_label[4] = *labels.add(global_idx);
-                    let mut j = 4;
+                // Insert into top-KNN_K
+                if d < best_d[KNN_K - 1] {
+                    best_d[KNN_K - 1] = d;
+                    best_id[KNN_K - 1] = global_idx as u32;
+                    best_label[KNN_K - 1] = *labels.add(global_idx);
+                    let mut j = KNN_K - 1;
                     while j > 0 && best_d[j] < best_d[j - 1] {
                         best_d.swap(j, j - 1);
                         best_id.swap(j, j - 1);

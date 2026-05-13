@@ -48,14 +48,14 @@ pub struct Payload {
 pub fn parse(buf: &[u8]) -> Option<VecPayload> {
     let p: Payload = serde_json::from_slice(buf).ok()?;
     let req = &p.transaction.requested_at;
-    let (y, mo, d, h, _min) = parse_iso_str(req)?;
+    let (y, mo, d, h, min) = parse_iso_str(req)?;
     let hour = h as u8;
     let day_of_week = day_of_week(y, mo, d) as u8;
 
     let (has_last_tx, minutes_since_last, km_from_current) = match &p.last_transaction {
         Some(lt) => {
             let (y2, mo2, d2, h2, min2) = parse_iso_str(&lt.timestamp)?;
-            let mins = minutes_between(y, mo, d, h, 0, y2, mo2, d2, h2, min2);
+            let mins = minutes_between(y2, mo2, d2, h2, min2, y, mo, d, h, min);
             (true, mins, lt.km_from_current)
         }
         None => (false, 0, 0.0),
