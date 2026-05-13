@@ -1,6 +1,6 @@
 services:
   api1:
-    image: ttl.sh/rinha-gustavo-2026:v41
+    image: ttl.sh/rinha-gustavo-2026:v42
     environment:
       - BIND=0.0.0.0:8080
     deploy:
@@ -14,7 +14,7 @@ services:
         hard: 65535
 
   api2:
-    image: ttl.sh/rinha-gustavo-2026:v41
+    image: ttl.sh/rinha-gustavo-2026:v42
     environment:
       - BIND=0.0.0.0:8080
     deploy:
@@ -28,9 +28,11 @@ services:
         hard: 65535
 
   lb:
-    image: nginx:alpine
-    volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    image: ttl.sh/rinha-gustavo-2026:v42
+    command: ["/lb"]
+    environment:
+      - PORT=9999
+      - UPSTREAMS=api1:8080,api2:8080
     ports:
       - "9999:9999"
     depends_on:
