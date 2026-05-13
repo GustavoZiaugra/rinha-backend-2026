@@ -3,6 +3,7 @@ use crate::json;
 use crate::knn;
 use crate::vector;
 
+use memchr::memmem;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -127,18 +128,7 @@ fn handle_request(path: &[u8], body: &[u8]) -> &'static [u8] {
 }
 
 fn memmem_find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() {
-        return Some(0);
-    }
-    if haystack.len() < needle.len() {
-        return None;
-    }
-    for i in 0..=haystack.len() - needle.len() {
-        if &haystack[i..i + needle.len()] == needle {
-            return Some(i);
-        }
-    }
-    None
+    memmem::find(haystack, needle)
 }
 
 fn parse_path(headers: &[u8]) -> &[u8] {
@@ -159,41 +149,39 @@ fn parse_path(headers: &[u8]) -> &[u8] {
 }
 
 fn parse_content_length(headers: &[u8]) -> Option<usize> {
-    let mut i = 0usize;
-    while i + 15 <= headers.len() {
-        if headers[i..i + 15].eq_ignore_ascii_case(b"content-length:") {
-            let mut p = i + 15;
-            while p < headers.len() && headers[p].is_ascii_whitespace() {
-                p += 1;
-            }
-            let mut v = 0usize;
-            while p < headers.len() && headers[p].is_ascii_digit() {
-                v = v * 10 + (headers[p] - b'0') as usize;
-                p += 1;
-            }
-            return Some(v);
-        }
-        i += 1;
+    // Try lowercase first, then title-case
+    const CL_LOWER: &[u8] = b"content-length:";
+    const CL_TITLE: &[u8] = b"Content-Length:";
+    let start = memmem::find(headers, CL_LOWER)
+        .or_else(|| memmem::find(headers, CL_TITLE))?;
+    let mut p = start + 15;
+    while p < headers.len() && headers[p].is_ascii_whitespace() {
+        p += 1;
     }
-    None
+    let mut v = 0usize;
+    while p < headers.len() && headers[p].is_ascii_digit() {
+        v = v * 10 + (headers[p] - b'0') as usize;
+        p += 1;
+    }
+    Some(v)
 }
 
 fn is_keepalive(headers: &[u8]) -> bool {
-    let mut i = 0usize;
-    while i + 10 <= headers.len() {
-        if headers[i..i + 10].eq_ignore_ascii_case(b"connection:") {
-            let mut p = i + 10;
-            while p < headers.len() && headers[p].is_ascii_whitespace() {
-                p += 1;
-            }
-            let start = p;
-            while p < headers.len() && !headers[p].is_ascii_whitespace() && headers[p] != b'\r' {
-                p += 1;
-            }
-            let val = &headers[start..p];
-            return val.eq_ignore_ascii_case(b"keep-alive");
+    const CONN: &[u8] = b"connection:";
+    const CONN_T: &[u8] = b"Connection:";
+    if let Some(start) = memmem::find(headers, CONN)
+        .or_else(|| memmem::find(headers, CONN_T))
+    {
+        let mut p = start + 10;
+        while p < headers.len() && headers[p].is_ascii_whitespace() {
+            p += 1;
         }
-        i += 1;
+        let start = p;
+        while p < headers.len() && !headers[p].is_ascii_whitespace() && headers[p] != b'\r' {
+            p += 1;
+        }
+        let val = &headers[start..p];
+        return val.eq_ignore_ascii_case(b"keep-alive");
     }
     true // HTTP/1.1 defaults to keep-alive
 }
