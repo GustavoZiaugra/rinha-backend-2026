@@ -1,6 +1,6 @@
 services:
   api1:
-    image: ttl.sh/rinha-gustavo-2026:v30
+    image: ttl.sh/rinha-gustavo-2026:v31
     environment:
       - BIND=0.0.0.0:8080
     deploy:
@@ -14,7 +14,7 @@ services:
         hard: 65535
 
   api2:
-    image: ttl.sh/rinha-gustavo-2026:v30
+    image: ttl.sh/rinha-gustavo-2026:v31
     environment:
       - BIND=0.0.0.0:8080
     deploy:
