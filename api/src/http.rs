@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 const RX_CAP: usize = 8192;
 
 /// Thread pool worker count — sufficient for 100 concurrent bot connections / 2 instances
-const WORKERS: usize = 100;
+const WORKERS: usize = 50;
 
 /// Flag to signal workers to shut down
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
