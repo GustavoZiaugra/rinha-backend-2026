@@ -5,22 +5,52 @@ use crate::vector;
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const RX_CAP: usize = 8192;
 
+/// Thread pool worker count
+const WORKERS: usize = 4;
+
+/// Flag to signal workers to shut down
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
 pub fn serve(listener: TcpListener) -> std::io::Result<()> {
-    for stream in listener.incoming() {
-        match stream {
-            Ok(mut stream) => {
-                let _ = stream.set_nonblocking(false);
-                std::thread::spawn(move || {
-                    handle_conn(&mut stream);
-                });
-            }
-            Err(_) => continue,
-        }
+    // Spawn N worker threads, each accepting from the shared listener.
+    // This avoids the overhead of spawning one thread per connection.
+    let listener = std::sync::Arc::new(listener);
+
+    let mut handles = Vec::with_capacity(WORKERS);
+    for id in 0..WORKERS {
+        let l = listener.clone();
+        handles.push(std::thread::spawn(move || {
+            worker(id, &l);
+        }));
+    }
+
+    // Wait for all workers to finish (shouldn't happen in normal operation)
+    for h in handles {
+        let _ = h.join();
     }
     Ok(())
+}
+
+fn worker(id: usize, listener: &TcpListener) {
+    loop {
+        if SHUTDOWN.load(Ordering::Relaxed) {
+            break;
+        }
+        match listener.accept() {
+            Ok((mut stream, addr)) => {
+                let _ = stream.set_nonblocking(false);
+                handle_conn(&mut stream);
+            }
+            Err(_) => {
+                // On accept error, briefly yield so we don't spin
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
 }
 
 fn handle_conn(stream: &mut TcpStream) {
