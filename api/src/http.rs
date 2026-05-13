@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 const RX_CAP: usize = 8192;
 
 /// Thread pool worker count — 12 threads for better throughput with low contention
-const WORKERS: usize = 12;
+const WORKERS: usize = 6;
 
 /// Flag to signal workers to shut down
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
