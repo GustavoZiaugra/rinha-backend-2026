@@ -4,19 +4,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends musl-tools && r
 WORKDIR /app
 COPY Cargo.toml ./
 COPY api ./api
-COPY lb ./lb
 COPY data/index.bin.gz ./data/index.bin.gz
 RUN rustup target add x86_64-unknown-linux-musl
 ENV RUSTFLAGS="-C target-cpu=haswell -C target-feature=+avx2,+fma,+f16c,+bmi2,+popcnt"
-RUN cargo build --release --target x86_64-unknown-linux-musl -p api -p lb
+RUN cargo build --release --target x86_64-unknown-linux-musl -p api
 RUN strip target/x86_64-unknown-linux-musl/release/api
-RUN strip target/x86_64-unknown-linux-musl/release/lb
 
 # Stage 2: Runtime
-FROM scratch
+FROM debian:12-slim
 COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/api /api
-COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/lb /lb
 COPY --from=builder /app/data/index.bin.gz /data/index.bin.gz
-ENV BIND=0.0.0.0:8080
-EXPOSE 8080
+ENV SOCK=/run/api.sock
 CMD ["/api"]
