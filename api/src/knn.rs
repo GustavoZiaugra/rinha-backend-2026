@@ -170,37 +170,43 @@ unsafe fn scan_and_count(probes: &[usize], ds: &Dataset, q_i16: &[i16; 14]) -> u
             }
 
             let block_ptr = blocks.add(bi * block_stride);
-            let mut dists8 = [0u64; 8];
-
-            // 14 dimensions of SSE accumulate
+            // SIMD-accumulate squared distances in AVX2 register,
+            // extract only once after all 14 dimensions — saves 13× extract/transmute/scalar-accumulate
+            // per block. Overflow check: each dim max 10000^2 = 1e8; ×14 = 1.4e9 < i32 max 2.147e9 ✓
+            let mut dists = _mm256_setzero_si256();
             for d in 0..14usize {
                 let qv = _mm256_set1_epi32(q_i16[d] as i32);
                 let vals = _mm_loadu_si128(block_ptr.add(d * 8) as *const __m128i);
                 let ve = _mm256_cvtepi16_epi32(vals);
                 let diff = _mm256_sub_epi32(ve, qv);
                 let sq = _mm256_mullo_epi32(diff, diff);
-                let lo = _mm256_extracti128_si256(sq, 0);
-                let hi = _mm256_extracti128_si256(sq, 1);
-
-                // Transpose lo/hi → accumulate 8 distances
-                let arr: [u32; 4] = std::mem::transmute(lo);
-                dists8[0] += arr[0] as u64;
-                dists8[1] += arr[1] as u64;
-                dists8[2] += arr[2] as u64;
-                dists8[3] += arr[3] as u64;
-                let arr2: [u32; 4] = std::mem::transmute(hi);
-                dists8[4] += arr2[0] as u64;
-                dists8[5] += arr2[1] as u64;
-                dists8[6] += arr2[2] as u64;
-                dists8[7] += arr2[3] as u64;
+                dists = _mm256_add_epi32(dists, sq);
             }
+
+            // Single extraction at the end
+            let dists_lo = _mm256_extracti128_si256(dists, 0);
+            let dists_hi = _mm256_extracti128_si256(dists, 1);
+            let arr: [u32; 4] = std::mem::transmute(dists_lo);
+            let d0 = arr[0];
+            let d1 = arr[1];
+            let d2 = arr[2];
+            let d3 = arr[3];
+            let arr2: [u32; 4] = std::mem::transmute(dists_hi);
+            let d4 = arr2[0];
+            let d5 = arr2[1];
+            let d6 = arr2[2];
+            let d7 = arr2[3];
 
             for v in 0..8usize {
                 let global_idx = bi * 8 + v;
                 if global_idx >= end {
                     break;
                 }
-                let d = (dists8[v] as f32) * VECTOR_SCALE * VECTOR_SCALE;
+                let raw = match v {
+                    0 => d0, 1 => d1, 2 => d2, 3 => d3,
+                    4 => d4, 5 => d5, 6 => d6, _ => d7,
+                };
+                let d = (raw as f32) * VECTOR_SCALE * VECTOR_SCALE;
 
                 if d < best_d[KNN_K - 1] {
                     best_d[KNN_K - 1] = d;

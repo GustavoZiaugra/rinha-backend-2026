@@ -11,9 +11,11 @@ use std::sync::Arc;
 
 const RX_CAP: usize = 8192;
 
-/// Size of the thread pool — 16 threads balances throughput vs cache thrashing.
-/// More threads cause excessive context switching and L1/L2 cache eviction on 0.45 CPU.
-const POOL_SIZE: usize = 16;
+/// Size of the thread pool — 48 threads reduce connection queueing.
+/// With keep-alive, each thread is tied to a connection for its lifetime.
+/// 48 threads × 256KB stack = 12MB, well within 160MB limit.
+/// More threads means fewer connections waiting in the pool queue.
+const POOL_SIZE: usize = 48;
 
 /// Flag to signal shutdown
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
