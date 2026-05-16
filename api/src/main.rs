@@ -1,6 +1,7 @@
 mod data;
 mod http;
 mod json;
+mod json_utils;
 mod knn;
 mod vector;
 
