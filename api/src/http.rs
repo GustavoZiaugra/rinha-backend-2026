@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 const RX_CAP: usize = 8192;
 
-/// Thread pool worker count — 2 threads for lower contention on 0.45 CPU
-const WORKERS: usize = 4;
+/// Thread pool worker count — 8 workers reduce queue wait to near zero on 100 concurrent.
+const WORKERS: usize = 8;
 
 /// Flag to signal workers to shut down
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -50,71 +50,110 @@ fn worker(listener: &UnixListener) {
     }
 }
 
-/// Handle a single HTTP request, then close the connection.
-/// No keep-alive — each connection handles exactly one request.
-/// This prevents worker threads from being tied up waiting for
-/// the next request on an idle keepalive connection.
+/// Handle one HTTP connection — supports keep-alive and request pipelining.
+/// Instead of closing after one request, we loop reading requests from the
+/// same connection. The bot can pipeline requests, reducing accept/connect
+/// overhead and keeping worker caches warm.
 fn handle_conn(stream: &mut (impl Read + Write)) {
     let mut buf = [0u8; RX_CAP];
     let mut used = 0usize;
 
     loop {
-        match stream.read(&mut buf[used..]) {
-            Ok(0) => break,
-            Ok(n) => used += n,
-            Err(_) => break,
-        }
+        // Read until we have at least headers + content-length bytes
+        loop {
+            match stream.read(&mut buf[used..]) {
+                Ok(0) => return,  // client closed
+                Ok(n) => used += n,
+                Err(_) => return,
+            }
 
-        if used < 16 {
-            continue;
-        }
-
-        let header_end = match memmem_find(&buf[..used], b"\r\n\r\n") {
-            Some(p) => p,
-            None => {
-                if used >= RX_CAP {
-                    break;
-                }
+            if used < 16 {
                 continue;
             }
-        };
 
-        let content_len = parse_content_length(&buf[..header_end]).unwrap_or(0);
-        let total_len = header_end + 4 + content_len;
-        if used < total_len {
-            continue;
+            let header_end = match memmem_find(&buf[..used], b"\r\n\r\n") {
+                Some(p) => p,
+                None => {
+                    if used >= RX_CAP {
+                        return;
+                    }
+                    continue;
+                }
+            };
+
+            let content_len = parse_content_length(&buf[..header_end]).unwrap_or(0);
+            let total_len = header_end + 4 + content_len;
+            if used < total_len {
+                continue;
+            }
+
+            let body = &buf[header_end + 4..total_len];
+            let path = parse_path(&buf[..header_end]);
+            let conn_close = has_connection_close(&buf[..header_end]);
+
+            let resp = match path {
+                b"/ready" => RESP_READY,
+                _ if !crate::is_ready() => RESP_NOT_READY,
+                b"/fraud-score" => {
+                    match json::parse(body) {
+                        Some(payload) => {
+                            let query = vector::vectorize(&payload);
+                            let ds = data::dataset();
+                            let fraud_count = knn::knn5_fraud_count(&query, ds);
+                            if conn_close {
+                                HTTP_FRAUD_CLOSE[fraud_count.min(5) as usize]
+                            } else {
+                                HTTP_FRAUD_KA[fraud_count.min(5) as usize]
+                            }
+                        }
+                        None => if conn_close { RESP_BAD_CLOSE } else { RESP_BAD_KA },
+                    }
+                }
+                _ => if conn_close { RESP_NOT_FOUND_CLOSE } else { RESP_NOT_FOUND_KA },
+            };
+
+            let _ = stream.write_all(resp);
+
+            // Shift remaining data for pipelined requests
+            let remaining = used - total_len;
+            if remaining > 0 {
+                buf.copy_within(total_len..used, 0);
+            }
+            used = remaining;
+
+            if conn_close {
+                return;
+            }
+            // Continue loop for next request
         }
-
-        let body = &buf[header_end + 4..total_len];
-        let path = parse_path(&buf[..header_end]);
-        let resp = handle_request(path, body);
-        let _ = stream.write_all(resp);
-
-        // Always close after one request — no keepalive
-        break;
     }
 }
 
-fn handle_request(path: &[u8], body: &[u8]) -> &'static [u8] {
-    // /ready ALWAYS returns 200 — health check must pass immediately
-    // even before dataset is fully loaded.
-    if path == b"/ready" {
-        return RESP_READY;
+/// Detect if the client sent "Connection: close"
+fn has_connection_close(headers: &[u8]) -> bool {
+    // Look for "Connection:" field — case-insensitive check
+    if let Some(mut p) = memmem_find(headers, b"Connection: ")
+        .or_else(|| memmem_find(headers, b"connection: "))
+    {
+        p += 12; // skip past "Connection: "
+        // Skip whitespace
+        while p < headers.len() && (headers[p] == b' ' || headers[p] == b'\t') {
+            p += 1;
+        }
+        // Check for "close" (case-insensitive)
+        if p + 4 < headers.len() {
+            let c = headers[p];
+            if (c == b'c' || c == b'C')
+                && (headers[p+1] == b'l' || headers[p+1] == b'L')
+                && (headers[p+2] == b'o' || headers[p+2] == b'O')
+                && (headers[p+3] == b's' || headers[p+3] == b'S')
+                && (headers[p+4] == b'e' || headers[p+4] == b'E')
+            {
+                return true;
+            }
+        }
     }
-    if !crate::is_ready() {
-        return RESP_NOT_READY;
-    }
-    if path != b"/fraud-score" {
-        return RESP_NOT_FOUND;
-    }
-    let payload = match json::parse(body) {
-        Some(p) => p,
-        None => return RESP_BAD,
-    };
-    let query = vector::vectorize(&payload);
-    let ds = data::dataset();
-    let fraud_count = knn::knn5_fraud_count(&query, ds);
-    HTTP_FRAUD[fraud_count.min(5) as usize]
+    false
 }
 
 fn memmem_find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -154,10 +193,20 @@ fn parse_content_length(headers: &[u8]) -> Option<usize> {
     Some(v)
 }
 
-/// All responses include Connection: close so each connection
-/// handles exactly one request. This prevents worker threads from
-/// blocking on idle keepalive connections.
-pub const HTTP_FRAUD: [&[u8]; 6] = [
+// ── Response constants ──────────────────────────────────────────────
+
+/// Fraud responses with Connection: keep-alive (HTTP/1.1 default)
+pub const HTTP_FRAUD_KA: [&[u8]; 6] = [
+    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 35\r\n\r\n{\"approved\":true,\"fraud_score\":0.0}",
+    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 35\r\n\r\n{\"approved\":true,\"fraud_score\":0.2}",
+    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 35\r\n\r\n{\"approved\":true,\"fraud_score\":0.4}",
+    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 36\r\n\r\n{\"approved\":false,\"fraud_score\":0.6}",
+    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 36\r\n\r\n{\"approved\":false,\"fraud_score\":0.8}",
+    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 36\r\n\r\n{\"approved\":false,\"fraud_score\":1.0}",
+];
+
+/// Fraud responses with Connection: close (when client requests it)
+pub const HTTP_FRAUD_CLOSE: [&[u8]; 6] = [
     b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 35\r\nConnection: close\r\n\r\n{\"approved\":true,\"fraud_score\":0.0}",
     b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 35\r\nConnection: close\r\n\r\n{\"approved\":true,\"fraud_score\":0.2}",
     b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 35\r\nConnection: close\r\n\r\n{\"approved\":true,\"fraud_score\":0.4}",
@@ -166,7 +215,10 @@ pub const HTTP_FRAUD: [&[u8]; 6] = [
     b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 36\r\nConnection: close\r\n\r\n{\"approved\":false,\"fraud_score\":1.0}",
 ];
 
-pub const RESP_READY: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-pub const RESP_NOT_FOUND: &[u8] = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-pub const RESP_BAD: &[u8] = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+/// Non-fraud responses — keep-alive variants (no Connection header → HTTP/1.1 default)
+pub const RESP_READY: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+pub const RESP_NOT_FOUND_KA: &[u8] = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+pub const RESP_NOT_FOUND_CLOSE: &[u8] = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+pub const RESP_BAD_KA: &[u8] = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
+pub const RESP_BAD_CLOSE: &[u8] = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 pub const RESP_NOT_READY: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";

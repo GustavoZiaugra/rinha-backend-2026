@@ -12,6 +12,7 @@ pub fn knn5_fraud_count(query: &[f32; 14], ds: &Dataset) -> u8 {
 }
 
 /// Minimal warmup: page-touch centroids + offsets for TLB residency.
+/// No SIMD needed — no target_feature annotation required.
 pub fn warmup() {
     let ds = crate::data::dataset();
     let mut sink: u64 = 0;
@@ -34,7 +35,8 @@ pub fn warmup() {
     }
 }
 
-/// Proven SSE-based KNN with K=4096 and NPROBE=20.
+/// Entry point: AVX2 centroid distances, SSE/AVX2 block scan.
+/// Tagged with avx2+fma because compute_centroid_dists uses FMA.
 #[target_feature(enable = "avx2,fma")]
 unsafe fn knn5_ivf(query: &[f32; 14], ds: &Dataset) -> u8 {
     let mut dists = [MaybeUninit::<f32>::uninit(); MAX_CENTROIDS];
@@ -50,6 +52,8 @@ unsafe fn knn5_ivf(query: &[f32; 14], ds: &Dataset) -> u8 {
     scan_and_count(&probes, ds, &q_i16)
 }
 
+/// AVX2 + FMA centroid distance computation.
+/// This is the ONLY function that genuinely needs FMA (_mm256_fmadd_ps).
 #[target_feature(enable = "avx2,fma")]
 unsafe fn compute_centroid_dists(
     query: &[f32; 14],
@@ -111,6 +115,7 @@ unsafe fn compute_centroid_dists(
     }
 }
 
+/// Simple top-N selection — no SIMD, no target_feature needed.
 #[inline(always)]
 unsafe fn top_n_from_dists<const N: usize>(
     dists: &[MaybeUninit<f32>; MAX_CENTROIDS],
@@ -136,12 +141,18 @@ unsafe fn top_n_from_dists<const N: usize>(
     out
 }
 
-/// SSE-based scan: 14-d integer accumulation in u64, proven from v54.
-#[target_feature(enable = "avx2,fma")]
+/// SSE/AVX2 block scan — uses integer AVX2 (cvtepi16_epi32, sub_epi32, mullo_epi32)
+/// but NOT FMA, so we only require "avx2". This avoids any potential AVX-FMA
+/// frequency downclock that would penalize the hot path.
+#[target_feature(enable = "avx2")]
 unsafe fn scan_and_count(probes: &[usize], ds: &Dataset, q_i16: &[i16; 14]) -> u8 {
     let mut best_d = [f32::MAX; KNN_K];
     let mut best_id = [0u32; KNN_K];
     let mut best_label = [0u8; KNN_K];
+
+    let blocks = ds.blocks.as_ptr();
+    let labels = ds.labels.as_ptr();
+    let block_stride = 14 * 8; // i16 per block
 
     for &ci in probes {
         let start = ds.offsets[ci] as usize;
@@ -149,11 +160,14 @@ unsafe fn scan_and_count(probes: &[usize], ds: &Dataset, q_i16: &[i16; 14]) -> u
         let block_start = start / 8;
         let block_end = (end + 7) / 8;
 
-        let blocks = ds.blocks.as_ptr();
-        let labels = ds.labels.as_ptr();
-        let block_stride = 14 * 8; // i16 per block
+        let mut bi = block_start;
+        while bi < block_end {
+            // Prefetch next block while processing current one
+            if bi + 1 < block_end {
+                let next = blocks.add((bi + 1) * block_stride) as *const i8;
+                _mm_prefetch(next, _MM_HINT_T0);
+            }
 
-        for bi in block_start..block_end {
             let block_ptr = blocks.add(bi * block_stride);
             let mut dists8 = [0u64; 8];
 
@@ -166,12 +180,14 @@ unsafe fn scan_and_count(probes: &[usize], ds: &Dataset, q_i16: &[i16; 14]) -> u
                 let sq = _mm256_mullo_epi32(diff, diff);
                 let lo = _mm256_extracti128_si256(sq, 0);
                 let hi = _mm256_extracti128_si256(sq, 1);
-                let arr = std::mem::transmute::<__m128i, [u32; 4]>(lo);
+
+                // Transpose lo/hi → accumulate 8 distances
+                let arr: [u32; 4] = std::mem::transmute(lo);
                 dists8[0] += arr[0] as u64;
                 dists8[1] += arr[1] as u64;
                 dists8[2] += arr[2] as u64;
                 dists8[3] += arr[3] as u64;
-                let arr2 = std::mem::transmute::<__m128i, [u32; 4]>(hi);
+                let arr2: [u32; 4] = std::mem::transmute(hi);
                 dists8[4] += arr2[0] as u64;
                 dists8[5] += arr2[1] as u64;
                 dists8[6] += arr2[2] as u64;
@@ -198,6 +214,8 @@ unsafe fn scan_and_count(probes: &[usize], ds: &Dataset, q_i16: &[i16; 14]) -> u
                     }
                 }
             }
+
+            bi += 1;
         }
     }
 
