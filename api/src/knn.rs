@@ -1,33 +1,30 @@
-use crate::data::{self, Dataset};
+use crate::data::Dataset;
 use std::arch::x86_64::*;
 use std::mem::MaybeUninit;
 
 const NPROBE: usize = 40;
 const MAX_CENTROIDS: usize = 4096;
 const VECTOR_SCALE: f32 = 0.0001;
+const KNN_K: usize = 5;
 
 pub fn knn5_fraud_count(query: &[f32; 14], ds: &Dataset) -> u8 {
     unsafe { knn5_ivf(query, ds) }
 }
 
-/// Warm up: XOR centroids + offsets for TLB/ cache residency, then short warmup.
+/// Minimal warmup: page-touch centroids + offsets for TLB residency.
 pub fn warmup() {
-    let ds = data::dataset();
-
+    let ds = crate::data::dataset();
     let mut sink: u64 = 0;
-
-    // XOR centroids to force each cache line into L2/L3
     for v in ds.centroids.iter() {
         sink ^= v.to_bits() as u64;
     }
-    for &v in ds.offsets.iter() {
-        sink ^= v as u64;
+    for v in ds.offsets.iter() {
+        sink ^= *v as u64;
     }
     let _ = sink;
-
-    // Brief warmup — 50 queries to prime L1 I-cache and branch predictor
+    // 20 quick synthetic queries for I-cache priming
     let mut state = 0x12345678u32;
-    for _ in 0..50 {
+    for _ in 0..20 {
         let mut q = [0.0f32; 14];
         for v in q.iter_mut() {
             state = state.wrapping_mul(1664525).wrapping_add(1013904223);
@@ -37,28 +34,21 @@ pub fn warmup() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Top-level KNN — single-tier search
-// ---------------------------------------------------------------------------
-
+/// Proven SSE-based KNN with K=4096 and NPROBE=40.
 #[target_feature(enable = "avx2,fma")]
 unsafe fn knn5_ivf(query: &[f32; 14], ds: &Dataset) -> u8 {
     let mut dists = [MaybeUninit::<f32>::uninit(); MAX_CENTROIDS];
     compute_centroid_dists(query, ds, &mut dists);
 
-    // Broadcast query per dimension for SIMD block scan
-    let mut q_vecs = [_mm256_setzero_ps(); 14];
+    // Quantize query to i16 for integer SSE scan
+    let mut q_i16 = [0i16; 14];
     for d in 0..14usize {
-        q_vecs[d] = _mm256_set1_ps(query[d]);
+        q_i16[d] = (query[d] / VECTOR_SCALE).round() as i16;
     }
 
     let probes = top_n_from_dists::<NPROBE>(&dists, ds.k);
-    scan_and_count(&probes, ds, &q_vecs)
+    scan_and_count(&probes, ds, &q_i16)
 }
-
-// ---------------------------------------------------------------------------
-// Centroid distance (SOA f32 → squared Euclidean, AVX2 FMA + 16-wide)
-// ---------------------------------------------------------------------------
 
 #[target_feature(enable = "avx2,fma")]
 unsafe fn compute_centroid_dists(
@@ -70,15 +60,16 @@ unsafe fn compute_centroid_dists(
     let cp = ds.centroids.as_ptr();
     let dp = dists.as_mut_ptr() as *mut f32;
 
-    // Dimension 0 (init)
     {
         let qd = _mm256_set1_ps(query[0]);
         let mut ci = 0usize;
         while ci + 16 <= k {
             let d0 = _mm256_sub_ps(_mm256_loadu_ps(cp.add(ci)), qd);
             let d1 = _mm256_sub_ps(_mm256_loadu_ps(cp.add(ci + 8)), qd);
-            _mm256_storeu_ps(dp.add(ci), _mm256_mul_ps(d0, d0));
-            _mm256_storeu_ps(dp.add(ci + 8), _mm256_mul_ps(d1, d1));
+            let s0 = _mm256_mul_ps(d0, d0);
+            let s1 = _mm256_mul_ps(d1, d1);
+            _mm256_storeu_ps(dp.add(ci), s0);
+            _mm256_storeu_ps(dp.add(ci + 8), s1);
             ci += 16;
         }
         while ci + 8 <= k {
@@ -93,7 +84,6 @@ unsafe fn compute_centroid_dists(
         }
     }
 
-    // Dimensions 1..13 (accumulate with FMA)
     for dim in 1..14usize {
         let qd = _mm256_set1_ps(query[dim]);
         let base = dim * k;
@@ -101,16 +91,16 @@ unsafe fn compute_centroid_dists(
         while ci + 16 <= k {
             let d0 = _mm256_sub_ps(_mm256_loadu_ps(cp.add(base + ci)), qd);
             let d1 = _mm256_sub_ps(_mm256_loadu_ps(cp.add(base + ci + 8)), qd);
-            let a0 = _mm256_loadu_ps(dp.add(ci));
-            let a1 = _mm256_loadu_ps(dp.add(ci + 8));
-            _mm256_storeu_ps(dp.add(ci), _mm256_fmadd_ps(d0, d0, a0));
-            _mm256_storeu_ps(dp.add(ci + 8), _mm256_fmadd_ps(d1, d1, a1));
+            let s0 = _mm256_fmadd_ps(d0, d0, _mm256_loadu_ps(dp.add(ci)));
+            let s1 = _mm256_fmadd_ps(d1, d1, _mm256_loadu_ps(dp.add(ci + 8)));
+            _mm256_storeu_ps(dp.add(ci), s0);
+            _mm256_storeu_ps(dp.add(ci + 8), s1);
             ci += 16;
         }
         while ci + 8 <= k {
             let d0 = _mm256_sub_ps(_mm256_loadu_ps(cp.add(base + ci)), qd);
-            let a0 = _mm256_loadu_ps(dp.add(ci));
-            _mm256_storeu_ps(dp.add(ci), _mm256_fmadd_ps(d0, d0, a0));
+            let s0 = _mm256_fmadd_ps(d0, d0, _mm256_loadu_ps(dp.add(ci)));
+            _mm256_storeu_ps(dp.add(ci), s0);
             ci += 8;
         }
         while ci < k {
@@ -121,176 +111,95 @@ unsafe fn compute_centroid_dists(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Select top-N centroids (AVX2 mask-scan)
-// ---------------------------------------------------------------------------
-
-#[target_feature(enable = "avx2,fma")]
+#[inline(always)]
 unsafe fn top_n_from_dists<const N: usize>(
     dists: &[MaybeUninit<f32>; MAX_CENTROIDS],
     k: usize,
 ) -> [usize; N] {
-    let mut top_dists = [f32::INFINITY; N];
-    let mut top_idx = [0usize; N];
     let dp = dists.as_ptr() as *const f32;
-    let mut ci = 0usize;
-
-    while ci + 8 <= k {
-        let d8 = _mm256_loadu_ps(dp.add(ci));
-        let mask = _mm256_movemask_ps(_mm256_cmp_ps(
-            d8,
-            _mm256_set1_ps(top_dists[N - 1]),
-            _CMP_LT_OQ,
-        )) as u32;
-
-        if mask != 0 {
-            let mut buf = [0.0f32; 8];
-            _mm256_storeu_ps(buf.as_mut_ptr(), d8);
-            let mut m = mask;
-            while m != 0 {
-                let s = m.trailing_zeros() as usize;
-                m &= m - 1;
-                let di = buf[s];
-                if di < top_dists[N - 1] {
-                    let pos = top_dists.partition_point(|&x| x < di);
-                    top_dists[pos..N].rotate_right(1);
-                    top_dists[pos] = di;
-                    top_idx[pos..N].rotate_right(1);
-                    top_idx[pos] = ci + s;
-                }
+    let mut best = [(f32::MAX, 0usize); N];
+    for i in 0..k {
+        let d = *dp.add(i);
+        if d < best[N - 1].0 {
+            best[N - 1] = (d, i);
+            let mut j = N - 1;
+            while j > 0 && best[j].0 < best[j - 1].0 {
+                best.swap(j, j - 1);
+                j -= 1;
             }
         }
-        ci += 8;
     }
-
-    while ci < k {
-        let di = *dp.add(ci);
-        if di < top_dists[N - 1] {
-            let pos = top_dists.partition_point(|&x| x < di);
-            top_dists[pos..N].rotate_right(1);
-            top_dists[pos] = di;
-            top_idx[pos..N].rotate_right(1);
-            top_idx[pos] = ci;
-        }
-        ci += 1;
+    let mut out = [0usize; N];
+    for i in 0..N {
+        out[i] = best[i].1;
     }
-
-    top_idx
+    out
 }
 
-// ---------------------------------------------------------------------------
-// Scan clusters: AVX2 FMA block scan with early termination and prefetch
-// ---------------------------------------------------------------------------
-
+/// SSE-based scan: 14-d integer accumulation in u64, proven from v54.
 #[target_feature(enable = "avx2,fma")]
-unsafe fn scan_and_count(probes: &[usize], ds: &Dataset, q_vecs: &[__m256; 14]) -> u8 {
-    let mut top: [(f32, u8); 5] = [(f32::INFINITY, 0); 5];
-    let mut worst_idx = 0usize;
-    let blocks_ptr = ds.blocks.as_ptr();
-    let labels_ptr = ds.labels.as_ptr();
+unsafe fn scan_and_count(probes: &[usize], ds: &Dataset, q_i16: &[i16; 14]) -> u8 {
+    let mut best_d = [f32::MAX; KNN_K];
+    let mut best_id = [0u32; KNN_K];
+    let mut best_label = [0u8; KNN_K];
 
     for &ci in probes {
-        let start = *ds.offsets.as_ptr().add(ci) as usize / 8;
-        let end = *ds.offsets.as_ptr().add(ci + 1) as usize / 8;
-        scan_blocks(
-            q_vecs,
-            blocks_ptr,
-            labels_ptr,
-            start,
-            end,
-            &mut top,
-            &mut worst_idx,
-        );
-    }
+        let start = ds.offsets[ci] as usize;
+        let end = ds.offsets[ci + 1] as usize;
+        let block_start = start / 8;
+        let block_end = (end + 7) / 8;
 
-    top.iter().filter(|(_, l)| *l == 1).count() as u8
-}
+        let blocks = ds.blocks.as_ptr();
+        let labels = ds.labels.as_ptr();
+        let block_stride = 14 * 8; // i16 per block
 
-/// Process 8 vectors per block using AVX2 FMA.
-/// Early termination after 8 dims — skip blocks where no vector beats threshold.
-/// Prefetch 8 blocks ahead to overlap memory latency.
-#[target_feature(enable = "avx2,fma")]
-unsafe fn scan_blocks(
-    q_vecs: &[__m256; 14],
-    blocks_ptr: *const i16,
-    labels_ptr: *const u8,
-    start_block: usize,
-    end_block: usize,
-    top: &mut [(f32, u8); 5],
-    worst_idx: &mut usize,
-) {
-    let scale = _mm256_set1_ps(VECTOR_SCALE);
+        for bi in block_start..block_end {
+            let block_ptr = blocks.add(bi * block_stride);
+            let mut dists8 = [0u64; 8];
 
-    macro_rules! dim_pair {
-        ($acc0:expr, $acc1:expr, $bb:expr, $d:expr) => {{
-            let r0 = _mm_loadu_si128(blocks_ptr.add($bb + $d * 8) as *const __m128i);
-            let r1 = _mm_loadu_si128(blocks_ptr.add($bb + ($d + 1) * 8) as *const __m128i);
-            let v0 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(r0)), scale);
-            let v1 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(r1)), scale);
-            let d0 = _mm256_sub_ps(v0, q_vecs[$d]);
-            let d1 = _mm256_sub_ps(v1, q_vecs[$d + 1]);
-            $acc0 = _mm256_fmadd_ps(d0, d0, $acc0);
-            $acc1 = _mm256_fmadd_ps(d1, d1, $acc1);
-        }};
-    }
+            // 14 dimensions of SSE accumulate
+            for d in 0..14usize {
+                let qv = _mm256_set1_epi32(q_i16[d] as i32);
+                let vals = _mm_loadu_si128(block_ptr.add(d * 8) as *const __m128i);
+                let ve = _mm256_cvtepi16_epi32(vals);
+                let diff = _mm256_sub_epi32(ve, qv);
+                let sq = _mm256_mullo_epi32(diff, diff);
+                let lo = _mm256_extracti128_si256(sq, 0);
+                let hi = _mm256_extracti128_si256(sq, 1);
+                let arr = std::mem::transmute::<__m128i, [u32; 4]>(lo);
+                dists8[0] += arr[0] as u64;
+                dists8[1] += arr[1] as u64;
+                dists8[2] += arr[2] as u64;
+                dists8[3] += arr[3] as u64;
+                let arr2 = std::mem::transmute::<__m128i, [u32; 4]>(hi);
+                dists8[4] += arr2[0] as u64;
+                dists8[5] += arr2[1] as u64;
+                dists8[6] += arr2[2] as u64;
+                dists8[7] += arr2[3] as u64;
+            }
 
-    'block: for block_i in start_block..end_block {
-        // Prefetch 8 blocks ahead
-        let pf = block_i + 8;
-        if pf < end_block {
-            _mm_prefetch(blocks_ptr.add(pf * 112) as *const i8, _MM_HINT_T0);
-            _mm_prefetch(blocks_ptr.add(pf * 112 + 56) as *const i8, _MM_HINT_T0);
-        }
+            for v in 0..8usize {
+                let global_idx = bi * 8 + v;
+                if global_idx >= end {
+                    break;
+                }
+                let d = (dists8[v] as f32) * VECTOR_SCALE * VECTOR_SCALE;
 
-        let bb = block_i * 112;
-        let threshold = _mm256_set1_ps(top[*worst_idx].0);
-
-        let mut acc0 = _mm256_setzero_ps();
-        let mut acc1 = _mm256_setzero_ps();
-
-        // Dim pairs 0-7 (4 pairs)
-        dim_pair!(acc0, acc1, bb, 0);
-        dim_pair!(acc0, acc1, bb, 2);
-        dim_pair!(acc0, acc1, bb, 4);
-        dim_pair!(acc0, acc1, bb, 6);
-
-        // Early termination: after 8 dims, skip if nothing beats threshold
-        let partial = _mm256_add_ps(acc0, acc1);
-        if _mm256_movemask_ps(_mm256_cmp_ps(partial, threshold, _CMP_LT_OQ)) == 0 {
-            continue 'block;
-        }
-
-        // Dim pairs 8-13 (3 pairs)
-        dim_pair!(acc0, acc1, bb, 8);
-        dim_pair!(acc0, acc1, bb, 10);
-        dim_pair!(acc0, acc1, bb, 12);
-
-        let acc = _mm256_add_ps(acc0, acc1);
-        let mut mask = _mm256_movemask_ps(_mm256_cmp_ps(acc, threshold, _CMP_LT_OQ)) as u32;
-        if mask == 0 {
-            continue;
-        }
-
-        let mut dists_buf = [0.0f32; 8];
-        _mm256_storeu_ps(dists_buf.as_mut_ptr(), acc);
-        let label_base = block_i * 8;
-        while mask != 0 {
-            let slot = mask.trailing_zeros() as usize;
-            mask &= mask - 1;
-            let di = dists_buf[slot];
-            if di < top[*worst_idx].0 {
-                top[*worst_idx] = (di, *labels_ptr.add(label_base + slot));
-                // Find new worst among 5 elements (linear scan — tiny)
-                let mut wi = 0;
-                let mut wv = top[0].0;
-                for j in 1..5 {
-                    if top[j].0 > wv {
-                        wv = top[j].0;
-                        wi = j;
+                if d < best_d[KNN_K - 1] {
+                    best_d[KNN_K - 1] = d;
+                    best_id[KNN_K - 1] = global_idx as u32;
+                    best_label[KNN_K - 1] = *labels.add(global_idx);
+                    let mut j = KNN_K - 1;
+                    while j > 0 && best_d[j] < best_d[j - 1] {
+                        best_d.swap(j, j - 1);
+                        best_id.swap(j, j - 1);
+                        best_label.swap(j, j - 1);
+                        j -= 1;
                     }
                 }
-                *worst_idx = wi;
             }
         }
     }
+
+    best_label.iter().filter(|&&l| l == 1).count() as u8
 }
