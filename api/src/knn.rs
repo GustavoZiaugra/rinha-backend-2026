@@ -2,7 +2,6 @@ use crate::data::Dataset;
 use std::arch::x86_64::*;
 use std::mem::MaybeUninit;
 
-const NPROBE: usize = 10;
 const MAX_CENTROIDS: usize = 4096;
 const VECTOR_SCALE: f32 = 0.0001;
 const KNN_K: usize = 5;
@@ -25,7 +24,11 @@ pub fn knn5_fraud_count_nprobe(query: &[f32; 14], ds: &Dataset, nprobe: usize) -
         }
 
         let probes = top_k_indices(&dists, ds.k, nprobe);
-        scan_and_count(&probes, ds, &q_i16)
+        let mut best_d = [f32::MAX; KNN_K];
+        let mut best_id = [0u32; KNN_K];
+        let mut best_label = [0u8; KNN_K];
+        scan_raw(&probes, ds, &q_i16, &mut best_d, &mut best_id, &mut best_label);
+        best_label.iter().filter(|&&l| l == 1).count() as u8
     }
 }
 
@@ -91,7 +94,7 @@ pub fn warmup() {
     }
 }
 
-/// Entry point: AVX2 centroid distances, SSE/AVX2 block scan.
+/// Entry point: two-tier KNN with FAST=5, FULL=10.
 /// Tagged with avx2+fma because compute_centroid_dists uses FMA.
 #[target_feature(enable = "avx2,fma")]
 unsafe fn knn5_ivf(query: &[f32; 14], ds: &Dataset) -> u8 {
@@ -104,8 +107,46 @@ unsafe fn knn5_ivf(query: &[f32; 14], ds: &Dataset) -> u8 {
         q_i16[d] = (query[d] / VECTOR_SCALE).round() as i16;
     }
 
-    let probes = top_n_from_dists::<NPROBE>(&dists, ds.k);
-    scan_and_count(&probes, ds, &q_i16)
+    // Two-tier search: always compute top 10, but try with 5 first.
+    // If clearly legit (0-1 fraud) or clearly fraud (4-5), return fast.
+    // Only ambiguous cases (2-3 fraud) scan the remaining 5 centroids.
+    const FAST_N: usize = 5;
+    const FULL_N: usize = 10;
+
+    let all_probes = top_n_from_dists::<FULL_N>(&dists, ds.k);
+
+    // Shared best-N state across tiers
+    let mut best_d = [f32::MAX; KNN_K];
+    let mut best_id = [0u32; KNN_K];
+    let mut best_label = [0u8; KNN_K];
+
+    // Tier 1: scan closest 5 centroids (~365 vectors)
+    scan_raw(
+        &all_probes[..FAST_N],
+        ds,
+        &q_i16,
+        &mut best_d,
+        &mut best_id,
+        &mut best_label,
+    );
+
+    let fast_count = best_label.iter().filter(|&&l| l == 1).count() as u8;
+    if fast_count <= 1 || fast_count >= 4 {
+        return fast_count;
+    }
+
+    // Tier 2: scan next 5 centroids, keeping Tier 1's best distances.
+    // Only reached for ~20-30% of queries (ambiguous fraud likelihood).
+    scan_raw(
+        &all_probes[FAST_N..],
+        ds,
+        &q_i16,
+        &mut best_d,
+        &mut best_id,
+        &mut best_label,
+    );
+
+    best_label.iter().filter(|&&l| l == 1).count() as u8
 }
 
 /// AVX2 + FMA centroid distance computation.
@@ -204,18 +245,24 @@ unsafe fn top_n_from_dists<const N: usize>(
     out
 }
 
-/// SSE/AVX2 block scan — uses integer AVX2 (cvtepi16_epi32, sub_epi32, mullo_epi32)
-/// but NOT FMA, so we only require "avx2". This avoids any potential AVX-FMA
-/// frequency downclock that would penalize the hot path.
+/// AVX2 block scan into existing best-N state.
+/// Accumulates distances into `best_d/best_id/best_label` without re-initializing.
+/// Used by two-tier KNN to carry state between tiers.
+///
+/// Uses integer AVX2 (cvtepi16_epi32, sub_epi32, mullo_epi32)
+/// but NOT FMA — avoids any potential AVX-FMA frequency downclock.
 #[target_feature(enable = "avx2")]
-unsafe fn scan_and_count(probes: &[usize], ds: &Dataset, q_i16: &[i16; 14]) -> u8 {
-    let mut best_d = [f32::MAX; KNN_K];
-    let mut best_id = [0u32; KNN_K];
-    let mut best_label = [0u8; KNN_K];
-
+unsafe fn scan_raw(
+    probes: &[usize],
+    ds: &Dataset,
+    q_i16: &[i16; 14],
+    best_d: &mut [f32; KNN_K],
+    best_id: &mut [u32; KNN_K],
+    best_label: &mut [u8; KNN_K],
+) {
     let blocks = ds.blocks.as_ptr();
     let labels = ds.labels.as_ptr();
-    let block_stride = 14 * 8; // i16 per block
+    let block_stride = 14 * 8;
 
     for &ci in probes {
         let start = ds.offsets[ci] as usize;
@@ -249,15 +296,7 @@ unsafe fn scan_and_count(probes: &[usize], ds: &Dataset, q_i16: &[i16; 14]) -> u
             let dists_lo = _mm256_extracti128_si256(dists, 0);
             let dists_hi = _mm256_extracti128_si256(dists, 1);
             let arr: [u32; 4] = std::mem::transmute(dists_lo);
-            let d0 = arr[0];
-            let d1 = arr[1];
-            let d2 = arr[2];
-            let d3 = arr[3];
             let arr2: [u32; 4] = std::mem::transmute(dists_hi);
-            let d4 = arr2[0];
-            let d5 = arr2[1];
-            let d6 = arr2[2];
-            let d7 = arr2[3];
 
             for v in 0..8usize {
                 let global_idx = bi * 8 + v;
@@ -265,8 +304,14 @@ unsafe fn scan_and_count(probes: &[usize], ds: &Dataset, q_i16: &[i16; 14]) -> u
                     break;
                 }
                 let raw = match v {
-                    0 => d0, 1 => d1, 2 => d2, 3 => d3,
-                    4 => d4, 5 => d5, 6 => d6, _ => d7,
+                    0 => arr[0],
+                    1 => arr[1],
+                    2 => arr[2],
+                    3 => arr[3],
+                    4 => arr2[0],
+                    5 => arr2[1],
+                    6 => arr2[2],
+                    _ => arr2[3],
                 };
                 let d = (raw as f32) * VECTOR_SCALE * VECTOR_SCALE;
 
@@ -287,8 +332,6 @@ unsafe fn scan_and_count(probes: &[usize], ds: &Dataset, q_i16: &[i16; 14]) -> u
             bi += 1;
         }
     }
-
-    best_label.iter().filter(|&&l| l == 1).count() as u8
 }
 
 // ── Accuracy Test ─────────────────────────────────────────────────────
