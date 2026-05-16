@@ -12,6 +12,44 @@ pub fn knn5_fraud_count(query: &[f32; 14], ds: &Dataset) -> u8 {
     unsafe { knn5_ivf(query, ds) }
 }
 
+/// Runtime-variant NPROBE for accuracy testing.
+/// Uses heap-allocated probes; never called on the hot path.
+pub fn knn5_fraud_count_nprobe(query: &[f32; 14], ds: &Dataset, nprobe: usize) -> u8 {
+    unsafe {
+        let mut dists = [MaybeUninit::<f32>::uninit(); MAX_CENTROIDS];
+        compute_centroid_dists(query, ds, &mut dists);
+
+        let mut q_i16 = [0i16; 14];
+        for d in 0..14usize {
+            q_i16[d] = (query[d] / VECTOR_SCALE).round() as i16;
+        }
+
+        let probes = top_k_indices(&dists, ds.k, nprobe);
+        scan_and_count(&probes, ds, &q_i16)
+    }
+}
+
+unsafe fn top_k_indices(dists: &[MaybeUninit<f32>; MAX_CENTROIDS], k: usize, n: usize) -> Vec<usize> {
+    let dp = dists.as_ptr() as *const f32;
+    let mut best = vec![(f32::MAX, 0usize); n];
+    for i in 0..k {
+        let d = *dp.add(i);
+        if d < best[n - 1].0 {
+            best[n - 1] = (d, i);
+            let mut j = n - 1;
+            while j > 0 && best[j].0 < best[j - 1].0 {
+                best.swap(j, j - 1);
+                j -= 1;
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        out.push(best[i].1);
+    }
+    out
+}
+
 /// Minimal warmup: page-touch centroids + offsets for TLB residency.
 /// No SIMD needed — no target_feature annotation required.
 pub fn warmup() {
@@ -69,6 +107,9 @@ unsafe fn compute_centroid_dists(
         let qd = _mm256_set1_ps(query[0]);
         let mut ci = 0usize;
         while ci + 16 <= k {
+            // Prefetch next centroids to overlap memory latency
+            _mm_prefetch(cp.add(ci + 32) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(cp.add(ci + 40) as *const i8, _MM_HINT_T0);
             let d0 = _mm256_sub_ps(_mm256_loadu_ps(cp.add(ci)), qd);
             let d1 = _mm256_sub_ps(_mm256_loadu_ps(cp.add(ci + 8)), qd);
             let s0 = _mm256_mul_ps(d0, d0);
@@ -94,6 +135,10 @@ unsafe fn compute_centroid_dists(
         let base = dim * k;
         let mut ci = 0usize;
         while ci + 16 <= k {
+            // Prefetch next centroids + accumulated distances
+            _mm_prefetch(cp.add(base + ci + 32) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(cp.add(base + ci + 40) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(dp.add(ci + 32) as *const i8, _MM_HINT_T0);
             let d0 = _mm256_sub_ps(_mm256_loadu_ps(cp.add(base + ci)), qd);
             let d1 = _mm256_sub_ps(_mm256_loadu_ps(cp.add(base + ci + 8)), qd);
             let s0 = _mm256_fmadd_ps(d0, d0, _mm256_loadu_ps(dp.add(ci)));
@@ -227,4 +272,78 @@ unsafe fn scan_and_count(probes: &[usize], ds: &Dataset, q_i16: &[i16; 14]) -> u
     }
 
     best_label.iter().filter(|&&l| l == 1).count() as u8
+}
+
+// ── Accuracy Test ─────────────────────────────────────────────────────
+// Compares KNN with runtime NPROBE vs exact KNN (NPROBE=MAX_CENTROIDS).
+
+use flate2::read::GzDecoder;
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+struct RefEntry {
+    vector: [f32; 14],
+    label: String,
+}
+
+/// Load references and run accuracy comparison.
+/// Returns (total, mismatches, fp, fn).
+pub fn accuracy_test(nprobe_test: usize, sample: usize) -> (usize, usize, usize, usize) {
+    let ds = crate::data::dataset();
+
+    let ref_path = std::env::var("REF_PATH")
+        .unwrap_or_else(|_| "data/references.json.gz".to_string());
+    eprintln!("[accuracy] loading {}...", ref_path);
+    let file = std::fs::File::open(&ref_path).unwrap_or_else(|e| {
+        let alt = format!("../../{}", ref_path);
+        std::fs::File::open(&alt)
+            .unwrap_or_else(|e2| panic!("can't open {} or {}: {}/{}", ref_path, alt, e, e2))
+    });
+    let gz = GzDecoder::new(std::io::BufReader::new(file));
+    let entries: Vec<RefEntry> = serde_json::from_reader(gz).unwrap();
+    eprintln!("[accuracy] {} entries loaded", entries.len());
+
+    let total = entries.len();
+    let step = if sample > 0 { total / sample } else { 1 };
+    let queries: Vec<&[f32; 14]> =
+        entries.iter().step_by(step).take(sample).map(|e| &e.vector).collect();
+    let true_labels: Vec<u8> =
+        entries.iter().step_by(step).take(sample).map(|e| {
+            if e.label == "fraud" { 1u8 } else { 0u8 }
+        }).collect();
+
+    eprintln!(
+        "[accuracy] testing {} queries with NPROBE={} vs exact...",
+        queries.len(), nprobe_test
+    );
+
+    let mut mismatches = 0usize;
+    let mut fp = 0usize;
+    let mut fn_ = 0usize;
+
+    for (i, (&q, &true_y)) in queries.iter().zip(true_labels.iter()).enumerate() {
+        let exact_fraud = knn5_fraud_count_nprobe(q, ds, MAX_CENTROIDS);
+        let test_fraud = knn5_fraud_count_nprobe(q, ds, nprobe_test);
+
+        if exact_fraud != test_fraud {
+            mismatches += 1;
+            if test_fraud >= 3 && exact_fraud < 3 {
+                fp += 1;
+            } else {
+                fn_ += 1;
+            }
+        }
+        if (i + 1) % 100 == 0 || i == queries.len() - 1 {
+            eprintln!("[accuracy] {}/{} errors={} fp={} fn={}",
+                i + 1, queries.len(), mismatches, fp, fn_);
+        }
+    }
+
+    eprintln!(
+        "[accuracy] DONE. NPROBE={:>3} | queries={} | errors={:>4} ({:.2}%) | fp={} | fn={}",
+        nprobe_test, queries.len(),
+        mismatches, mismatches as f64 / queries.len() as f64 * 100.0,
+        fp, fn_
+    );
+    (queries.len(), mismatches, fp, fn_)
 }
