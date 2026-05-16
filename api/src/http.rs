@@ -7,33 +7,27 @@ use memchr::memmem;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 const RX_CAP: usize = 8192;
 
-/// Thread pool worker count — 8 workers reduce queue wait to near zero on 100 concurrent.
-const WORKERS: usize = 8;
+/// Size of the thread pool — 256 threads with 256 KB stacks eliminates accept queue
+/// while fitting comfortably in our 165 MB container (256 × 256 KB = 64 MB stacks).
+/// fksegundo (#1 at 0.83ms p99) uses 512 threads; 256 is a safe start.
+const POOL_SIZE: usize = 256;
 
-/// Flag to signal workers to shut down
+/// Flag to signal shutdown
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 pub fn serve(listener: UnixListener) -> std::io::Result<()> {
-    let listener = std::sync::Arc::new(listener);
+    let listener = Arc::new(listener);
 
-    let mut handles = Vec::with_capacity(WORKERS);
-    for _ in 0..WORKERS {
-        let l = listener.clone();
-        handles.push(std::thread::spawn(move || {
-            worker(&l);
-        }));
-    }
+    let pool = threadpool::Builder::new()
+        .num_threads(POOL_SIZE)
+        .thread_stack_size(256 * 1024) // 256 KB per thread
+        .build();
 
-    for h in handles {
-        let _ = h.join();
-    }
-    Ok(())
-}
-
-fn worker(listener: &UnixListener) {
+    // Accept loop runs on the main thread — dispatches connections to the pool
     loop {
         if SHUTDOWN.load(Ordering::Relaxed) {
             break;
@@ -41,19 +35,25 @@ fn worker(listener: &UnixListener) {
         match listener.accept() {
             Ok((mut stream, _addr)) => {
                 let _ = stream.set_nonblocking(false);
-                handle_conn(&mut stream);
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
+                pool.execute(move || {
+                    handle_conn(&mut stream);
+                });
             }
             Err(_) => {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
         }
     }
+
+    Ok(())
 }
 
 /// Handle one HTTP connection — supports keep-alive and request pipelining.
-/// Instead of closing after one request, we loop reading requests from the
-/// same connection. The bot can pipeline requests, reducing accept/connect
-/// overhead and keeping worker caches warm.
+/// Reads requests from the connection in a loop and writes responses.
+/// With 256 pool threads, even blocking on read() for the next request is fine —
+/// the pool has plenty of threads to handle other connections.
 fn handle_conn(stream: &mut (impl Read + Write)) {
     let mut buf = [0u8; RX_CAP];
     let mut used = 0usize;
@@ -124,23 +124,20 @@ fn handle_conn(stream: &mut (impl Read + Write)) {
             if conn_close {
                 return;
             }
-            // Continue loop for next request
+            // Continue loop for next request (keep-alive)
         }
     }
 }
 
 /// Detect if the client sent "Connection: close"
 fn has_connection_close(headers: &[u8]) -> bool {
-    // Look for "Connection:" field — case-insensitive check
     if let Some(mut p) = memmem_find(headers, b"Connection: ")
         .or_else(|| memmem_find(headers, b"connection: "))
     {
-        p += 12; // skip past "Connection: "
-        // Skip whitespace
+        p += 12;
         while p < headers.len() && (headers[p] == b' ' || headers[p] == b'\t') {
             p += 1;
         }
-        // Check for "close" (case-insensitive)
         if p + 4 < headers.len() {
             let c = headers[p];
             if (c == b'c' || c == b'C')
@@ -215,7 +212,7 @@ pub const HTTP_FRAUD_CLOSE: [&[u8]; 6] = [
     b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 36\r\nConnection: close\r\n\r\n{\"approved\":false,\"fraud_score\":1.0}",
 ];
 
-/// Non-fraud responses — keep-alive variants (no Connection header → HTTP/1.1 default)
+/// Non-fraud responses
 pub const RESP_READY: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
 pub const RESP_NOT_FOUND_KA: &[u8] = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
 pub const RESP_NOT_FOUND_CLOSE: &[u8] = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";

@@ -1,6 +1,6 @@
 services:
   api1:
-    image: ttl.sh/rinha-gustavo-2026:v59
+    image: ttl.sh/rinha-gustavo-2026:v62
     environment:
       - SOCK=/sockets/api1.sock
     volumes:
@@ -16,7 +16,7 @@ services:
         hard: 65535
 
   api2:
-    image: ttl.sh/rinha-gustavo-2026:v59
+    image: ttl.sh/rinha-gustavo-2026:v62
     environment:
       - SOCK=/sockets/api2.sock
     volumes:
