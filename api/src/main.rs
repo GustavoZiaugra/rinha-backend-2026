@@ -18,6 +18,23 @@ pub fn is_ready() -> bool {
 }
 
 fn main() {
+    // If ACCURACY_TEST env var is set, run accuracy test and exit
+    if let Ok(nprobe_str) = std::env::var("ACCURACY_TEST") {
+        let nprobe: usize = nprobe_str.parse().unwrap_or(15);
+        let sample: usize = std::env::var("ACCURACY_SAMPLE")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(200);
+        data::init();
+        let (total, errors, fp, fn_) = knn::accuracy_test(nprobe, sample);
+        if errors > 0 {
+            eprintln!("ACCURACY FAIL: NPROBE={} | {}/{} errors (FP={}, FN={})",
+                nprobe, errors, total, fp, fn_);
+            std::process::exit(1);
+        } else {
+            eprintln!("ACCURACY PASS: NPROBE={} | {} queries, zero errors", nprobe, total);
+            std::process::exit(0);
+        }
+    }
+
     let sock_path = std::env::var("SOCK").unwrap_or_else(|_| "/run/api.sock".to_string());
 
     // Remove stale socket file if present
