@@ -2,7 +2,7 @@ use crate::data::Dataset;
 use std::arch::x86_64::*;
 use std::mem::MaybeUninit;
 
-const NPROBE: usize = 15;
+const NPROBE: usize = 20;
 const MAX_CENTROIDS: usize = 4096;
 const VECTOR_SCALE: f32 = 0.0001;
 const KNN_K: usize = 5;
@@ -69,6 +69,9 @@ unsafe fn compute_centroid_dists(
         let qd = _mm256_set1_ps(query[0]);
         let mut ci = 0usize;
         while ci + 16 <= k {
+            // Prefetch 32 centroids ahead to overlap memory latency
+            _mm_prefetch(cp.add(ci + 32) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(cp.add(ci + 40) as *const i8, _MM_HINT_T0);
             let d0 = _mm256_sub_ps(_mm256_loadu_ps(cp.add(ci)), qd);
             let d1 = _mm256_sub_ps(_mm256_loadu_ps(cp.add(ci + 8)), qd);
             let s0 = _mm256_mul_ps(d0, d0);
@@ -94,6 +97,10 @@ unsafe fn compute_centroid_dists(
         let base = dim * k;
         let mut ci = 0usize;
         while ci + 16 <= k {
+            // Prefetch next centroids + accumulated distances
+            _mm_prefetch(cp.add(base + ci + 32) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(cp.add(base + ci + 40) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(dp.add(ci + 32) as *const i8, _MM_HINT_T0);
             let d0 = _mm256_sub_ps(_mm256_loadu_ps(cp.add(base + ci)), qd);
             let d1 = _mm256_sub_ps(_mm256_loadu_ps(cp.add(base + ci + 8)), qd);
             let s0 = _mm256_fmadd_ps(d0, d0, _mm256_loadu_ps(dp.add(ci)));
@@ -103,6 +110,7 @@ unsafe fn compute_centroid_dists(
             ci += 16;
         }
         while ci + 8 <= k {
+            _mm_prefetch(cp.add(base + ci + 16) as *const i8, _MM_HINT_T0);
             let d0 = _mm256_sub_ps(_mm256_loadu_ps(cp.add(base + ci)), qd);
             let s0 = _mm256_fmadd_ps(d0, d0, _mm256_loadu_ps(dp.add(ci)));
             _mm256_storeu_ps(dp.add(ci), s0);
