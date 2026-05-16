@@ -11,24 +11,16 @@ use std::sync::Arc;
 
 const RX_CAP: usize = 8192;
 
-/// Size of the thread pool — 48 threads reduce connection queueing.
-/// With keep-alive, each thread is tied to a connection for its lifetime.
-/// 48 threads × 256KB stack = 12MB, well within 160MB limit.
-/// More threads means fewer connections waiting in the pool queue.
-const POOL_SIZE: usize = 48;
-
 /// Flag to signal shutdown
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 pub fn serve(listener: UnixListener) -> std::io::Result<()> {
     let listener = Arc::new(listener);
 
-    let pool = threadpool::Builder::new()
-        .num_threads(POOL_SIZE)
-        .thread_stack_size(256 * 1024) // 256 KB per thread
-        .build();
-
-    // Accept loop runs on the main thread — dispatches connections to the pool
+    // Accept loop: spawn one OS thread per connection (256KB stack each).
+    // Threads block on read() between keep-alive requests, consuming zero CPU.
+    // 100 connections × 256KB = 25.6MB — well within 160MB memory limit.
+    // No thread pool queue means zero wait for connection dispatch.
     loop {
         if SHUTDOWN.load(Ordering::Relaxed) {
             break;
@@ -38,9 +30,12 @@ pub fn serve(listener: UnixListener) -> std::io::Result<()> {
                 let _ = stream.set_nonblocking(false);
                 let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
                 let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
-                pool.execute(move || {
-                    handle_conn(&mut stream);
-                });
+                std::thread::Builder::new()
+                    .stack_size(256 * 1024)
+                    .spawn(move || {
+                        handle_conn(&mut stream);
+                    })
+                    .ok();
             }
             Err(_) => {
                 std::thread::sleep(std::time::Duration::from_millis(1));
