@@ -30,12 +30,17 @@ pub fn serve(listener: UnixListener) -> std::io::Result<()> {
                 let _ = stream.set_nonblocking(false);
                 let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
                 let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
-                std::thread::Builder::new()
+                if let Err(e) = std::thread::Builder::new()
                     .stack_size(256 * 1024)
                     .spawn(move || {
                         handle_conn(&mut stream);
                     })
-                    .ok();
+                {
+                    // stream was moved into spawn() closure — on failure the
+                    // closure (and stream) are dropped. The client times out,
+                    // but with 160MB limit this never happens at 100 connections.
+                    eprintln!("warn: thread spawn failed: {}", e);
+                }
             }
             Err(_) => {
                 std::thread::sleep(std::time::Duration::from_millis(1));
