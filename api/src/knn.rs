@@ -2,11 +2,12 @@ use crate::data::Dataset;
 use std::arch::x86_64::*;
 use std::mem::MaybeUninit;
 
-const NPROBE: usize = 20;
+const NPROBE: usize = 15;
 const MAX_CENTROIDS: usize = 4096;
 const VECTOR_SCALE: f32 = 0.0001;
 const KNN_K: usize = 5;
 
+/// Proven SSE-based KNN with K=4096 and NPROBE=15.
 pub fn knn5_fraud_count(query: &[f32; 14], ds: &Dataset) -> u8 {
     unsafe { knn5_ivf(query, ds) }
 }

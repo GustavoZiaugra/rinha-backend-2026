@@ -11,10 +11,9 @@ use std::sync::Arc;
 
 const RX_CAP: usize = 8192;
 
-/// Size of the thread pool — 256 threads with 256 KB stacks eliminates accept queue
-/// while fitting comfortably in our 165 MB container (256 × 256 KB = 64 MB stacks).
-/// fksegundo (#1 at 0.83ms p99) uses 512 threads; 256 is a safe start.
-const POOL_SIZE: usize = 256;
+/// Size of the thread pool — 16 threads balances throughput vs cache thrashing.
+/// More threads cause excessive context switching and L1/L2 cache eviction on 0.45 CPU.
+const POOL_SIZE: usize = 16;
 
 /// Flag to signal shutdown
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
