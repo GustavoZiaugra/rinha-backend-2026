@@ -35,7 +35,6 @@ fn main() {
         addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
 
         // Copy path into sun_path (null-terminated) via raw pointer
-        // sun_path is [i8; 108] on Linux, we need to write u8 bytes into it
         let bytes = sock_path.as_bytes();
         let len = bytes.len().min(107);
         unsafe {
@@ -65,9 +64,11 @@ fn main() {
         std::os::unix::net::UnixListener::from_raw_fd(fd)
     };
 
-    // Initialize dataset in background
+    // Initialize dataset in background, then warm up
     std::thread::spawn(move || {
         data::init();
+        // Warm up: force page residency and prime CPU caches
+        knn::warmup();
         READY.store(true, Ordering::Relaxed);
     });
 
