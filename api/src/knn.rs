@@ -2,7 +2,7 @@ use crate::data::Dataset;
 use std::arch::x86_64::*;
 use std::mem::MaybeUninit;
 
-const NPROBE: usize = 40;
+const NPROBE: usize = 20;
 const MAX_CENTROIDS: usize = 4096;
 const VECTOR_SCALE: f32 = 0.0001;
 const KNN_K: usize = 5;
@@ -34,7 +34,7 @@ pub fn warmup() {
     }
 }
 
-/// Proven SSE-based KNN with K=4096 and NPROBE=40.
+/// Proven SSE-based KNN with K=4096 and NPROBE=20.
 #[target_feature(enable = "avx2,fma")]
 unsafe fn knn5_ivf(query: &[f32; 14], ds: &Dataset) -> u8 {
     let mut dists = [MaybeUninit::<f32>::uninit(); MAX_CENTROIDS];

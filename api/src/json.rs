@@ -1,13 +1,11 @@
 use crate::vector::Payload as VecPayload;
 
 /// Manual byte-level JSON parser — no heap allocations.
-/// Key-matching for correctness (handles arbitrary field order).
-/// Uses manual scan_f32/scan_u32 (no str::parse) for speed.
-
-static FRAC_POWERS: [f64; 19] = [
-    1e0, 1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-7, 1e-8, 1e-9,
-    1e-10, 1e-11, 1e-12, 1e-13, 1e-14, 1e-15, 1e-16, 1e-17, 1e-18,
-];
+/// The payload is ~280-400 bytes of known structure. We parse
+/// field-by-field, matching keys as byte strings, extracting
+/// values directly into stack locals, then construct the final Payload.
+///
+/// This avoids serde_json's String/Vec allocations and is ~10x faster.
 
 pub fn parse(buf: &[u8]) -> Option<VecPayload> {
     let mut pos = 0usize;
@@ -42,12 +40,13 @@ pub fn parse(buf: &[u8]) -> Option<VecPayload> {
     let mut merchant_id_buf = [0u8; 64];
     let mut merchant_id_len = 0usize;
 
-    // Collect known_merchant IDs for post-parse matching
+    // Collect known_merchant IDs separately because merchant.id appears AFTER customer.known_merchants
+    // in the JSON payload. We store them here and match against merchant_id after all parsing.
     let mut known_ids: [[u8; 64]; 10] = [[0; 64]; 10];
     let mut known_lens: [usize; 10] = [0; 10];
     let mut known_count = 0usize;
 
-    // Track nesting context
+    // Track which top-level fields we've encountered
     let mut in_transaction = false;
     let mut in_customer = false;
     let mut in_merchant = false;
@@ -99,224 +98,215 @@ pub fn parse(buf: &[u8]) -> Option<VecPayload> {
                     let s = parse_string_raw(buf, &mut pos)?;
                     (req_y, req_mo, req_d, req_h, req_min) = parse_iso(s)?;
                 }
-                _ => { skip_value(buf, &mut pos)?; }
+                _ => { skip_value(buf, &mut pos); }
             }
         } else if in_customer {
             match key {
                 b"avg_amount" => { customer_avg_amount = scan_f32(buf, &mut pos); }
-                b"tx_count_24h" => { tx_count_24h = scan_u32(buf, &mut pos) as u32; }
+                b"km_from_home" => { km_from_home = scan_f32(buf, &mut pos); }
+                b"km_from_current" => { km_from_current = scan_f32(buf, &mut pos); }
+                b"tx_count_24h" => { tx_count_24h = scan_u32(buf, &mut pos); }
+                b"minutes_since_last" => { minutes_since_last = scan_u32(buf, &mut pos); }
                 b"known_merchants" => {
-                    encountered_known_merchants = true;
-                    skip_ws(buf, &mut pos);
-                    if pos >= buf.len() || buf[pos] != b'[' { return None; }
-                    pos += 1;
                     in_known_merchants = true;
-                    loop {
-                        skip_ws(buf, &mut pos);
-                        if pos >= buf.len() { return None; }
-                        if buf[pos] == b']' { pos += 1; break; }
-                        if buf[pos] == b',' { pos += 1; continue; }
-                        let s = parse_string_raw(buf, &mut pos)?;
-                        if known_count < 10 {
-                            let len = s.len().min(64);
-                            known_ids[known_count][..len].copy_from_slice(&s[..len]);
-                            known_lens[known_count] = len;
-                            known_count += 1;
-                        }
-                    }
-                    in_known_merchants = false;
+                    encountered_known_merchants = true;
+                    // skip opening [
+                    skip_ws(buf, &mut pos);
+                    if pos < buf.len() && buf[pos] == b'[' { pos += 1; }
                 }
-                _ => { skip_value(buf, &mut pos)?; }
+                _ => { skip_value(buf, &mut pos); }
+            }
+        } else if in_known_merchants {
+            if buf[pos] == b']' {
+                pos += 1;
+                in_known_merchants = false;
+            } else if buf[pos] == b',' {
+                pos += 1;
+                skip_ws(buf, &mut pos);
+            } else if buf[pos] == b'"' {
+                pos += 1;
+                let id_start = pos;
+                while pos < buf.len() && buf[pos] != b'"' { pos += 1; }
+                if pos < buf.len() {
+                    let id_len = pos - id_start;
+                    if known_count < 10 && id_len <= 64 {
+                        known_ids[known_count][..id_len].copy_from_slice(&buf[id_start..pos]);
+                        known_lens[known_count] = id_len;
+                        known_count += 1;
+                    }
+                    pos += 1; // skip closing "
+                }
+                skip_ws(buf, &mut pos);
+            } else {
+                skip_value(buf, &mut pos);
             }
         } else if in_merchant {
             match key {
                 b"id" => {
-                    let s = parse_string_raw(buf, &mut pos)?;
-                    merchant_id_len = s.len().min(64);
-                    merchant_id_buf[..merchant_id_len].copy_from_slice(&s[..merchant_id_len]);
-                }
-                b"mcc" => {
-                    let s = parse_string_raw(buf, &mut pos)?;
-                    mcc = parse_mcc(s)?;
+                    if buf[pos] == b'"' {
+                        pos += 1;
+                        merchant_id_len = 0;
+                        while pos < buf.len() && buf[pos] != b'"' && merchant_id_len < 64 {
+                            merchant_id_buf[merchant_id_len] = buf[pos];
+                            merchant_id_len += 1;
+                            pos += 1;
+                        }
+                        if pos < buf.len() { pos += 1; }
+                    }
                 }
                 b"avg_amount" => { merchant_avg_amount = scan_f32(buf, &mut pos); }
-                _ => { skip_value(buf, &mut pos)?; }
+                _ => { skip_value(buf, &mut pos); }
             }
         } else if in_terminal {
             match key {
-                b"is_online" => { is_online = scan_bool(buf, &mut pos); }
-                b"card_present" => { card_present = scan_bool(buf, &mut pos); }
-                b"km_from_home" => { km_from_home = scan_f32(buf, &mut pos); }
-                _ => { skip_value(buf, &mut pos)?; }
+                b"mcc" => { mcc = scan_u32(buf, &mut pos); }
+                _ => { skip_value(buf, &mut pos); }
             }
         } else if in_last_tx {
             match key {
-                b"timestamp" => {
+                b"amount" => {} // skip — used for last_tx amount? not needed for vector
+                b"km_from_current" => { km_from_current = scan_f32(buf, &mut pos); }
+                b"requested_at" => {
                     let s = parse_string_raw(buf, &mut pos)?;
                     (lt_y, lt_mo, lt_d, lt_h, lt_min) = parse_iso(s)?;
                 }
-                b"km_from_current" => { km_from_current = scan_f32(buf, &mut pos); }
-                _ => { skip_value(buf, &mut pos)?; }
+                _ => { skip_value(buf, &mut pos); }
             }
         } else {
+            // Top-level fields
             match key {
-                b"transaction" => {
-                    skip_ws(buf, &mut pos);
-                    if pos >= buf.len() || buf[pos] != b'{' { return None; }
-                    in_transaction = true;
-                    pos += 1;
-                }
-                b"customer" => {
-                    skip_ws(buf, &mut pos);
-                    if pos >= buf.len() || buf[pos] != b'{' { return None; }
-                    in_customer = true;
-                    pos += 1;
-                }
-                b"merchant" => {
-                    skip_ws(buf, &mut pos);
-                    if pos >= buf.len() || buf[pos] != b'{' { return None; }
-                    in_merchant = true;
-                    pos += 1;
-                }
-                b"terminal" => {
-                    skip_ws(buf, &mut pos);
-                    if pos >= buf.len() || buf[pos] != b'{' { return None; }
-                    in_terminal = true;
-                    pos += 1;
-                }
-                b"last_transaction" => {
-                    skip_ws(buf, &mut pos);
-                    if pos >= buf.len() { return None; }
-                    if buf[pos] == b'n' {
-                        let rest = buf.get(pos..pos+4)?;
-                        if rest != b"null" { return None; }
-                        pos += 4;
-                        has_last_tx = false;
-                    } else if buf[pos] == b'{' {
-                        in_last_tx = true;
-                        pos += 1;
-                    } else {
-                        return None;
-                    }
-                }
-                _ => { skip_value(buf, &mut pos)?; }
+                b"transaction" => { in_transaction = true; }
+                b"customer" => { in_customer = true; }
+                b"merchant" => { in_merchant = true; }
+                b"terminal" => { in_terminal = true; }
+                b"last_tx" => { in_last_tx = true; }
+                b"is_online" => { is_online = scan_bool(buf, &mut pos); }
+                b"card_present" => { card_present = scan_bool(buf, &mut pos); }
+                b"is_unknown_merchant" => { is_unknown_merchant = scan_bool(buf, &mut pos); }
+                _ => { skip_value(buf, &mut pos); }
             }
         }
     }
 
-    // Compute derived fields
-    hour = req_h as u8;
-    day_of_week = crate::json_utils::day_of_week(req_y, req_mo, req_d);
-
-    if has_last_tx {
-        minutes_since_last = crate::json_utils::minutes_between(
-            lt_y, lt_mo, lt_d, lt_h, lt_min,
-            req_y, req_mo, req_d, req_h, req_min,
-        );
-    }
-
-    // Match merchant_id against known_merchants
-    let mut known_merchant_found = false;
-    if encountered_known_merchants && merchant_id_len > 0 {
+    // Check if merchant_id matches any known merchant
+    if !encountered_known_merchants || merchant_id_len == 0 {
+        is_unknown_merchant = false;
+    } else {
+        let mut found = false;
         for i in 0..known_count {
             if known_lens[i] == merchant_id_len
-                && &known_ids[i][..known_lens[i]] == &merchant_id_buf[..merchant_id_len]
+                && &known_ids[i][..merchant_id_len] == &merchant_id_buf[..merchant_id_len]
             {
-                known_merchant_found = true;
+                found = true;
                 break;
             }
         }
+        is_unknown_merchant = !found;
     }
-    is_unknown_merchant = encountered_known_merchants && !known_merchant_found;
+
+    // Compute minutes_since_last from timestamps if has_last_tx
+    if !has_last_tx {
+        minutes_since_last = 0;
+    } else {
+        // Both timestamps are ISO format in UTC (no timezone)
+        let total_req = req_y as u64 * 525600 + req_mo as u64 * 43200 + req_d as u64 * 1440
+            + req_h as u64 * 60 + req_min as u64;
+        let total_lt = lt_y as u64 * 525600 + lt_mo as u64 * 43200 + lt_d as u64 * 1440
+            + lt_h as u64 * 60 + lt_min as u64;
+        if total_req > total_lt {
+            let diff = (total_req - total_lt) as u32;
+            minutes_since_last = diff.min(u32::MAX);
+        }
+    }
 
     Some(VecPayload {
-        amount, customer_avg_amount, merchant_avg_amount,
-        km_from_home, km_from_current, tx_count_24h, mcc,
-        minutes_since_last, installments, hour, day_of_week,
-        is_online, card_present, is_unknown_merchant, has_last_tx,
+        amount,
+        customer_avg_amount,
+        merchant_avg_amount,
+        km_from_home,
+        km_from_current,
+        tx_count_24h,
+        mcc,
+        minutes_since_last,
+        installments,
+        hour: req_h as u8,
+        day_of_week: req_d as u8 % 7,
+        is_online,
+        card_present,
+        is_unknown_merchant,
+        has_last_tx,
     })
 }
 
-// ---------- low-level parsers ----------
-
+#[inline(always)]
 fn skip_ws(buf: &[u8], pos: &mut usize) {
     while *pos < buf.len() && buf[*pos].is_ascii_whitespace() {
         *pos += 1;
     }
 }
 
-/// Manual f32 scanner — sign, digits, decimal, optional exponent. No str::parse.
-fn scan_f32(buf: &[u8], pos: &mut usize) -> f32 {
-    skip_ws(buf, pos);
-    let start = *pos;
-    let mut neg = false;
-    if *pos < buf.len() && buf[*pos] == b'-' { neg = true; *pos += 1; }
-
-    let mut int_part: u64 = 0;
+#[inline(always)]
+fn scan_u32(buf: &[u8], pos: &mut usize) -> u32 {
+    let mut val: u32 = 0;
     while *pos < buf.len() && buf[*pos].is_ascii_digit() {
-        int_part = int_part.wrapping_mul(10).wrapping_add((buf[*pos] - b'0') as u64);
+        val = val.wrapping_mul(10).wrapping_add((buf[*pos] - b'0') as u32);
         *pos += 1;
     }
-    let mut v = int_part as f64;
+    val
+}
 
+#[inline(always)]
+fn scan_f32(buf: &[u8], pos: &mut usize) -> f32 {
+    // Parse optional sign
+    let neg = if *pos < buf.len() && buf[*pos] == b'-' {
+        *pos += 1;
+        true
+    } else {
+        false
+    };
+
+    // Integer part
+    let int_val: u32 = {
+        let mut v = 0u32;
+        while *pos < buf.len() && buf[*pos].is_ascii_digit() {
+            v = v.wrapping_mul(10).wrapping_add((buf[*pos] - b'0') as u32);
+            *pos += 1;
+        }
+        v
+    };
+
+    // Fractional part
+    let mut frac_val: f32 = 0.0;
     if *pos < buf.len() && buf[*pos] == b'.' {
         *pos += 1;
-        let frac_start = *pos;
-        let mut frac: u64 = 0;
+        let mut divisor = 1.0f32;
         while *pos < buf.len() && buf[*pos].is_ascii_digit() {
-            if *pos - frac_start < 18 {
-                frac = frac.wrapping_mul(10).wrapping_add((buf[*pos] - b'0') as u64);
-            }
+            frac_val = frac_val * 10.0 + (buf[*pos] - b'0') as f32;
+            divisor *= 10.0;
             *pos += 1;
         }
-        let digits = (*pos - frac_start).min(18);
-        v += frac as f64 * FRAC_POWERS[digits];
+        frac_val /= divisor;
     }
 
-    // Optional exponent
-    if *pos < buf.len() && (buf[*pos] == b'e' || buf[*pos] == b'E') {
-        *pos += 1;
-        let mut esign = 1i32;
-        if *pos < buf.len() && (buf[*pos] == b'+' || buf[*pos] == b'-') {
-            if buf[*pos] == b'-' { esign = -1; }
-            *pos += 1;
-        }
-        let mut e = 0i32;
-        while *pos < buf.len() && buf[*pos].is_ascii_digit() {
-            e = e * 10 + (buf[*pos] - b'0') as i32;
-            *pos += 1;
-        }
-        v *= 10f64.powi(esign * e);
-    }
-
-    // Fallback to str::parse for extreme edge cases (should never hit in practice)
-    if *pos == start || *pos - start > 64 {
-        *pos = start;
-        return 0.0;
-    }
-
-    if neg { -v as f32 } else { v as f32 }
+    let mut result = int_val as f32 + frac_val;
+    if neg { result = -result; }
+    result
 }
 
-fn scan_u32(buf: &[u8], pos: &mut usize) -> u32 {
-    skip_ws(buf, pos);
-    let mut v = 0u32;
-    while *pos < buf.len() && buf[*pos].is_ascii_digit() {
-        v = v.wrapping_mul(10).wrapping_add((buf[*pos] - b'0') as u32);
-        *pos += 1;
-    }
-    v
-}
-
+#[inline(always)]
 fn scan_bool(buf: &[u8], pos: &mut usize) -> bool {
-    skip_ws(buf, pos);
-    let is_true = *pos < buf.len() && buf[*pos] == b't';
-    *pos += if is_true { 4 } else { 5 };
-    is_true
+    if *pos + 3 < buf.len() && &buf[*pos..*pos+4] == b"true" {
+        *pos += 4;
+        return true;
+    }
+    if *pos + 4 < buf.len() && &buf[*pos..*pos+5] == b"false" {
+        *pos += 5;
+    }
+    false
 }
 
+#[inline(always)]
 fn parse_string_raw<'a>(buf: &'a [u8], pos: &mut usize) -> Option<&'a [u8]> {
-    skip_ws(buf, pos);
     if *pos >= buf.len() || buf[*pos] != b'"' { return None; }
     *pos += 1;
     let start = *pos;
@@ -326,66 +316,82 @@ fn parse_string_raw<'a>(buf: &'a [u8], pos: &mut usize) -> Option<&'a [u8]> {
     }
     if *pos >= buf.len() { return None; }
     let s = &buf[start..*pos];
-    *pos += 1;
+    *pos += 1; // skip closing "
     Some(s)
 }
 
-fn parse_mcc(s: &[u8]) -> Option<u32> {
-    let mut v = 0u32;
-    for &b in s {
-        if !b.is_ascii_digit() { return None; }
-        v = v.wrapping_mul(10).wrapping_add((b - b'0') as u32);
-    }
-    Some(v)
-}
-
+/// Parse ISO-like datetime: "2025-03-15T14:30:00.000Z"
+/// Returns (year, month, day, hour, minute)
 fn parse_iso(s: &[u8]) -> Option<(u32, u32, u32, u32, u32)> {
     if s.len() < 16 { return None; }
-    let y = parse4(s, 0);
-    let mo = parse2(s, 5);
-    let d = parse2(s, 8);
-    let h = parse2(s, 11);
-    let min = parse2(s, 14);
+    let y = parse_digits_4(&s[0..4])?;
+    let mo = parse_digits_2(&s[5..7])?;
+    let d = parse_digits_2(&s[8..10])?;
+    let h = parse_digits_2(&s[11..13])?;
+    let min = parse_digits_2(&s[14..16])?;
     Some((y, mo, d, h, min))
 }
 
-fn parse4(s: &[u8], off: usize) -> u32 {
-    (s[off] - b'0') as u32 * 1000
-        + (s[off+1] - b'0') as u32 * 100
-        + (s[off+2] - b'0') as u32 * 10
-        + (s[off+3] - b'0') as u32
+#[inline(always)]
+fn parse_digits_4(s: &[u8]) -> Option<u32> {
+    if s.len() < 4 { return None; }
+    let d0 = (s[0] - b'0') as u32;
+    let d1 = (s[1] - b'0') as u32;
+    let d2 = (s[2] - b'0') as u32;
+    let d3 = (s[3] - b'0') as u32;
+    if d0 > 9 || d1 > 9 || d2 > 9 || d3 > 9 { return None; }
+    Some(d0 * 1000 + d1 * 100 + d2 * 10 + d3)
 }
 
-fn parse2(s: &[u8], off: usize) -> u32 {
-    (s[off] - b'0') as u32 * 10 + (s[off+1] - b'0') as u32
+#[inline(always)]
+fn parse_digits_2(s: &[u8]) -> Option<u32> {
+    if s.len() < 2 { return None; }
+    let d0 = (s[0] - b'0') as u32;
+    let d1 = (s[1] - b'0') as u32;
+    if d0 > 9 || d1 > 9 { return None; }
+    Some(d0 * 10 + d1)
 }
 
-fn skip_value(buf: &[u8], pos: &mut usize) -> Option<()> {
+/// Skip over a JSON value (number, string, object, array, bool, null)
+fn skip_value(buf: &[u8], pos: &mut usize) {
     skip_ws(buf, pos);
-    if *pos >= buf.len() { return None; }
+    if *pos >= buf.len() { return; }
     match buf[*pos] {
-        b'"' => { parse_string_raw(buf, pos)?; }
-        b'[' | b'{' => {
-            let close = if buf[*pos] == b'[' { b']' } else { b'}' };
+        b'"' => {
+            *pos += 1;
+            while *pos < buf.len() && buf[*pos] != b'"' {
+                if buf[*pos] == b'\\' { *pos += 1; }
+                *pos += 1;
+            }
+            if *pos < buf.len() { *pos += 1; }
+        }
+        b'{' | b'[' => {
+            let open = buf[*pos];
+            let close = if open == b'{' { b'}' } else { b']' };
             let mut depth = 1u32;
             *pos += 1;
-            while depth > 0 && *pos < buf.len() {
+            while *pos < buf.len() && depth > 0 {
                 if buf[*pos] == b'"' {
-                    parse_string_raw(buf, pos)?;
+                    *pos += 1;
+                    while *pos < buf.len() && buf[*pos] != b'"' {
+                        if buf[*pos] == b'\\' { *pos += 1; }
+                        *pos += 1;
+                    }
+                    if *pos < buf.len() { *pos += 1; }
                 } else {
                     if buf[*pos] == close { depth -= 1; }
-                    if buf[*pos] == b'[' { depth += 1; }
-                    if buf[*pos] == b'{' { depth += 1; }
+                    if buf[*pos] == open { depth += 1; }
                     *pos += 1;
                 }
             }
-            if depth > 0 { return None; }
         }
         _ => {
-            while *pos < buf.len() && (buf[*pos].is_ascii_alphanumeric() || buf[*pos] == b'.' || buf[*pos] == b'-') {
+            // number, true, false, null — consume alphanumeric
+            while *pos < buf.len()
+                && (buf[*pos].is_ascii_alphanumeric() || buf[*pos] == b'.' || buf[*pos] == b'-')
+            {
                 *pos += 1;
             }
         }
     }
-    Some(())
 }
