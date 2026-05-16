@@ -1,374 +1,307 @@
 use crate::vector::Payload as VecPayload;
 
-/// Manual byte-level JSON parser — no heap allocations.
-/// The payload is ~280-400 bytes of known structure. We parse
-/// field-by-field, matching keys as byte strings, extracting
-/// values directly into stack locals, then construct the final Payload.
-///
-/// This avoids serde_json's String/Vec allocations and is ~10x faster.
+/// Manual byte-level JSON parser — no heap allocations, no str::parse.
+/// Uses memchr2 for fast field scanning and manual f32/u32 parsers.
+
+/// Power-of-10 table for fast fractional conversion
+static FRAC_POWERS: [f64; 19] = [
+    1e0, 1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-7, 1e-8, 1e-9, 
+    1e-10, 1e-11, 1e-12, 1e-13, 1e-14, 1e-15, 1e-16, 1e-17, 1e-18,
+];
 
 pub fn parse(buf: &[u8]) -> Option<VecPayload> {
-    let mut pos = 0usize;
-    skip_ws(buf, &mut pos);
+    let mut p = 0usize;
 
-    // Expect opening {
-    if pos >= buf.len() || buf[pos] != b'{' { return None; }
-    pos += 1;
+    to_next_value(&mut p, buf)?;
+    skip_string(&mut p, buf)?;
 
-    let mut amount = 0.0f32;
-    let mut customer_avg_amount = 0.0f32;
-    let mut merchant_avg_amount = 0.0f32;
-    let mut km_from_home = 0.0f32;
-    let mut km_from_current = 0.0f32;
-    let mut tx_count_24h = 0u32;
-    let mut mcc = 0u32;
-    let mut minutes_since_last = 0u32;
-    let mut installments = 0u8;
-    let mut hour = 0u8;
-    let mut day_of_week = 0u8;
-    let mut is_online = false;
-    let mut card_present = false;
-    let mut is_unknown_merchant = false;
-    let mut has_last_tx = false;
+    to_next_value(&mut p, buf)?;
+    to_next_value(&mut p, buf)?;
+    let amount = scan_f32(&mut p, buf);
 
-    // Temp storage for dates
-    let mut req_y = 0u32; let mut req_mo = 0u32; let mut req_d = 0u32;
-    let mut req_h = 0u32; let mut req_min = 0u32;
-    let mut lt_y = 0u32; let mut lt_mo = 0u32; let mut lt_d = 0u32;
-    let mut lt_h = 0u32; let mut lt_min = 0u32;
+    to_next_value(&mut p, buf)?;
+    let installments = scan_u32(&mut p, buf) as u8;
 
-    let mut merchant_id_buf = [0u8; 64];
-    let mut merchant_id_len = 0usize;
+    to_next_value(&mut p, buf)?;
+    let (req_y, req_mo, req_d, req_h, req_min) = scan_iso(&mut p, buf)?;
 
-    // Collect known_merchant IDs separately because merchant.id appears AFTER customer.known_merchants
-    // in the JSON payload. We store them here and match against merchant_id after all parsing.
-    let mut known_ids: [[u8; 64]; 10] = [[0; 64]; 10];
-    let mut known_lens: [usize; 10] = [0; 10];
-    let mut known_count = 0usize;
+    to_next_value(&mut p, buf)?;
+    to_next_value(&mut p, buf)?;
+    let customer_avg_amount = scan_f32(&mut p, buf);
 
-    // Track which top-level fields we've encountered
-    let mut in_transaction = false;
-    let mut in_customer = false;
-    let mut in_merchant = false;
-    let mut in_terminal = false;
-    let mut in_last_tx = false;
-    let mut in_known_merchants = false;
-    let mut encountered_known_merchants = false;
+    to_next_value(&mut p, buf)?;
+    let tx_count_24h = scan_u32(&mut p, buf);
 
-    loop {
-        skip_ws(buf, &mut pos);
-        if pos >= buf.len() { return None; }
-        if buf[pos] == b'}' {
-            // End of current object
-            pos += 1;
-            if in_transaction { in_transaction = false; continue; }
-            if in_customer { in_customer = false; continue; }
-            if in_merchant { in_merchant = false; continue; }
-            if in_terminal { in_terminal = false; continue; }
-            if in_last_tx { in_last_tx = false; has_last_tx = true; continue; }
-            if in_known_merchants { in_known_merchants = false; continue; }
-            break; // end of root object
-        }
-
-        if buf[pos] == b',' { pos += 1; skip_ws(buf, &mut pos); }
-        if pos >= buf.len() { return None; }
-
-        // Parse string key
-        if buf[pos] != b'"' { return None; }
-        pos += 1;
-        let key_start = pos;
-        while pos < buf.len() && buf[pos] != b'"' {
-            if buf[pos] == b'\\' { pos += 1; } // skip escaped char
-            pos += 1;
-        }
-        if pos >= buf.len() { return None; }
-        let key = &buf[key_start..pos];
-        pos += 1; // skip closing "
-
-        skip_ws(buf, &mut pos);
-        if pos >= buf.len() || buf[pos] != b':' { return None; }
-        pos += 1;
-        skip_ws(buf, &mut pos);
-        if pos >= buf.len() { return None; }
-
-        if in_transaction {
-            match key {
-                b"amount" => { amount = parse_float(buf, &mut pos)?; }
-                b"installments" => { installments = parse_int(buf, &mut pos)? as u8; }
-                b"requested_at" => {
-                    let s = parse_string_raw(buf, &mut pos)?;
-                    (req_y, req_mo, req_d, req_h, req_min) = parse_iso(s)?;
-                }
-                _ => { skip_value(buf, &mut pos)?; }
+    to_next_value(&mut p, buf)?;
+    // known_merchants array — collect up to 16 slices
+    p += 1; // skip [
+    let mut merchant_slices: [&[u8]; 16] = [&[]; 16];
+    let mut mc = 0usize;
+    while p < buf.len() && buf[p] != b']' {
+        if buf[p] == b'"' {
+            p += 1;
+            let start = p;
+            let end = memchr::memchr(b'"', &buf[p..])?;
+            if mc < 16 {
+                merchant_slices[mc] = &buf[start..start + end];
+                mc += 1;
             }
-        } else if in_customer {
-            match key {
-                b"avg_amount" => { customer_avg_amount = parse_float(buf, &mut pos)?; }
-                b"tx_count_24h" => { tx_count_24h = parse_int(buf, &mut pos)? as u32; }
-                b"known_merchants" => {
-                    encountered_known_merchants = true;
-                    skip_ws(buf, &mut pos);
-                    if pos >= buf.len() || buf[pos] != b'[' { return None; }
-                    pos += 1;
-                    in_known_merchants = true;
-                    // Parse array until ]
-                    loop {
-                        skip_ws(buf, &mut pos);
-                        if pos >= buf.len() { return None; }
-                        if buf[pos] == b']' { pos += 1; break; }
-                        if buf[pos] == b',' { pos += 1; continue; }
-                        let s = parse_string_raw(buf, &mut pos)?;
-                        // Collect known_merchant IDs for post-parse matching
-                        // (merchant.id appears later in the JSON payload)
-                        if known_count < 10 {
-                            let len = s.len().min(64);
-                            known_ids[known_count][..len].copy_from_slice(&s[..len]);
-                            known_lens[known_count] = len;
-                            known_count += 1;
-                        }
-                    }
-                    in_known_merchants = false;
-                }
-                _ => { skip_value(buf, &mut pos)?; }
-            }
-        } else if in_merchant {
-            match key {
-                b"id" => {
-                    let s = parse_string_raw(buf, &mut pos)?;
-                    merchant_id_len = s.len().min(64);
-                    merchant_id_buf[..merchant_id_len].copy_from_slice(&s[..merchant_id_len]);
-                }
-                b"mcc" => {
-                    let s = parse_string_raw(buf, &mut pos)?;
-                    mcc = parse_mcc(s)?;
-                }
-                b"avg_amount" => { merchant_avg_amount = parse_float(buf, &mut pos)?; }
-                _ => { skip_value(buf, &mut pos)?; }
-            }
-        } else if in_terminal {
-            match key {
-                b"is_online" => { is_online = parse_bool(buf, &mut pos)?; }
-                b"card_present" => { card_present = parse_bool(buf, &mut pos)?; }
-                b"km_from_home" => { km_from_home = parse_float(buf, &mut pos)?; }
-                _ => { skip_value(buf, &mut pos)?; }
-            }
-        } else if in_last_tx {
-            match key {
-                b"timestamp" => {
-                    let s = parse_string_raw(buf, &mut pos)?;
-                    (lt_y, lt_mo, lt_d, lt_h, lt_min) = parse_iso(s)?;
-                }
-                b"km_from_current" => { km_from_current = parse_float(buf, &mut pos)?; }
-                _ => { skip_value(buf, &mut pos)?; }
-            }
+            p = start + end + 1;
         } else {
-            // Top-level fields
-            match key {
-                b"transaction" => {
-                    skip_ws(buf, &mut pos);
-                    if pos >= buf.len() || buf[pos] != b'{' { return None; }
-                    in_transaction = true;
-                    pos += 1;
-                }
-                b"customer" => {
-                    skip_ws(buf, &mut pos);
-                    if pos >= buf.len() || buf[pos] != b'{' { return None; }
-                    in_customer = true;
-                    pos += 1;
-                }
-                b"merchant" => {
-                    skip_ws(buf, &mut pos);
-                    if pos >= buf.len() || buf[pos] != b'{' { return None; }
-                    in_merchant = true;
-                    pos += 1;
-                }
-                b"terminal" => {
-                    skip_ws(buf, &mut pos);
-                    if pos >= buf.len() || buf[pos] != b'{' { return None; }
-                    in_terminal = true;
-                    pos += 1;
-                }
-                b"last_transaction" => {
-                    skip_ws(buf, &mut pos);
-                    if pos >= buf.len() { return None; }
-                    if buf[pos] == b'n' {
-                        // null
-                        let rest = buf.get(pos..pos+4)?;
-                        if rest != b"null" { return None; }
-                        pos += 4;
-                        has_last_tx = false;
-                    } else if buf[pos] == b'{' {
-                        in_last_tx = true;
-                        pos += 1;
-                    } else {
-                        return None;
-                    }
-                }
-                _ => { skip_value(buf, &mut pos)?; }
-            }
+            p += 1;
         }
     }
-
-    // Compute minutes and day_of_week
-    hour = req_h as u8;
-    day_of_week = crate::json_utils::day_of_week(req_y, req_mo, req_d);
-
-    if has_last_tx {
-        minutes_since_last = crate::json_utils::minutes_between(
-            lt_y, lt_mo, lt_d, lt_h, lt_min,
-            req_y, req_mo, req_d, req_h, req_min,
-        );
+    if p < buf.len() {
+        p += 1; // skip ]
     }
 
-    // Match merchant_id against known_merchants collected earlier
-    // (merchant section is parsed AFTER customer, so now merchant_id is available)
-    let mut known_merchant_found = false;
-    if encountered_known_merchants && merchant_id_len > 0 {
-        for i in 0..known_count {
-            if known_lens[i] == merchant_id_len
-                && &known_ids[i][..known_lens[i]] == &merchant_id_buf[..merchant_id_len]
-            {
-                known_merchant_found = true;
-                break;
-            }
-        }
-    }
-    is_unknown_merchant = encountered_known_merchants && !known_merchant_found;
+    to_next_value(&mut p, buf)?;
+    to_next_value(&mut p, buf)?;
+    let merchant_id = scan_string(&mut p, buf)?;
+
+    to_next_value(&mut p, buf)?;
+    let mcc = scan_mcc(&mut p, buf);
+
+    to_next_value(&mut p, buf)?;
+    let merchant_avg_amount = scan_f32(&mut p, buf);
+
+    to_next_value(&mut p, buf)?;
+    to_next_value(&mut p, buf)?;
+    let is_online = scan_bool(&mut p, buf);
+
+    to_next_value(&mut p, buf)?;
+    let card_present = scan_bool(&mut p, buf);
+
+    to_next_value(&mut p, buf)?;
+    let km_from_home = scan_f32(&mut p, buf);
+
+    // last_transaction — may be null
+    to_next_value(&mut p, buf)?;
+    let has_last_tx = p < buf.len() && buf[p] != b'n';
+    let (minutes_since_last, km_from_current) = if has_last_tx {
+        to_next_value(&mut p, buf)?;
+        let (ly, lmo, ld, lh, lmin) = scan_iso(&mut p, buf)?;
+        to_next_value(&mut p, buf)?;
+        let km = scan_f32(&mut p, buf);
+        let mins = minutes_between(ly, lmo, ld, lh, lmin, req_y, req_mo, req_d, req_h, req_min);
+        (mins, km)
+    } else {
+        (0, 0.0)
+    };
+
+    let is_unknown_merchant = !merchant_slices[..mc].iter().any(|&m| m == merchant_id);
 
     Some(VecPayload {
         amount,
+        installments,
+        hour: req_h,
+        day_of_week: day_of_week(req_y, req_mo, req_d),
         customer_avg_amount,
-        merchant_avg_amount,
-        km_from_home,
-        km_from_current,
         tx_count_24h,
         mcc,
-        minutes_since_last,
-        installments,
-        hour,
-        day_of_week,
+        merchant_avg_amount,
         is_online,
         card_present,
+        km_from_home,
         is_unknown_merchant,
         has_last_tx,
+        minutes_since_last,
+        km_from_current,
     })
 }
 
-// ---------- low-level parsers ----------
+// ---------- Navigation helpers ----------
 
-fn skip_ws(buf: &[u8], pos: &mut usize) {
-    while *pos < buf.len() && buf[*pos].is_ascii_whitespace() {
-        *pos += 1;
-    }
-}
-
-fn parse_float(buf: &[u8], pos: &mut usize) -> Option<f32> {
-    let mut neg = false;
-    skip_ws(buf, pos);
-    if *pos >= buf.len() { return None; }
-    if buf[*pos] == b'-' { neg = true; *pos += 1; }
-    let start = *pos;
-    while *pos < buf.len() && (buf[*pos].is_ascii_digit() || buf[*pos] == b'.') {
-        *pos += 1;
-    }
-    if *pos == start { return None; }
-    let s = std::str::from_utf8(&buf[start..*pos]).ok()?;
-    let v: f32 = s.parse().ok()?;
-    Some(if neg { -v } else { v })
-}
-
-fn parse_int(buf: &[u8], pos: &mut usize) -> Option<u32> {
-    skip_ws(buf, pos);
-    let start = *pos;
-    while *pos < buf.len() && buf[*pos].is_ascii_digit() {
-        *pos += 1;
-    }
-    if *pos == start { return None; }
-    let s = std::str::from_utf8(&buf[start..*pos]).ok()?;
-    s.parse().ok()
-}
-
-fn parse_bool(buf: &[u8], pos: &mut usize) -> Option<bool> {
-    skip_ws(buf, pos);
-    if buf.get(*pos..*pos+4) == Some(b"true") {
-        *pos += 4;
-        Some(true)
-    } else if buf.get(*pos..*pos+5) == Some(b"false") {
-        *pos += 5;
-        Some(false)
-    } else {
-        None
-    }
-}
-
-fn parse_string_raw<'a>(buf: &'a [u8], pos: &mut usize) -> Option<&'a [u8]> {
-    skip_ws(buf, pos);
-    if *pos >= buf.len() || buf[*pos] != b'"' { return None; }
-    *pos += 1;
-    let start = *pos;
-    while *pos < buf.len() && buf[*pos] != b'"' {
-        if buf[*pos] == b'\\' { *pos += 1; }
-        *pos += 1;
-    }
-    if *pos >= buf.len() { return None; }
-    let s = &buf[start..*pos];
-    *pos += 1; // closing "
-    Some(s)
-}
-
-fn parse_mcc(s: &[u8]) -> Option<u32> {
-    std::str::from_utf8(s).ok()?.parse().ok()
-}
-
-fn parse_iso(s: &[u8]) -> Option<(u32, u32, u32, u32, u32)> {
-    if s.len() < 16 { return None; }
-    let y = parse4(s, 0);
-    let mo = parse2(s, 5);
-    let d = parse2(s, 8);
-    let h = parse2(s, 11);
-    let min = parse2(s, 14);
-    Some((y, mo, d, h, min))
-}
-
-fn parse4(s: &[u8], off: usize) -> u32 {
-    (s[off] - b'0') as u32 * 1000
-        + (s[off+1] - b'0') as u32 * 100
-        + (s[off+2] - b'0') as u32 * 10
-        + (s[off+3] - b'0') as u32
-}
-
-fn parse2(s: &[u8], off: usize) -> u32 {
-    (s[off] - b'0') as u32 * 10 + (s[off+1] - b'0') as u32
-}
-
-/// Skip over a JSON value entirely (doesn't matter what type)
-fn skip_value(buf: &[u8], pos: &mut usize) -> Option<()> {
-    skip_ws(buf, pos);
-    if *pos >= buf.len() { return None; }
-    match buf[*pos] {
-        b'"' => { parse_string_raw(buf, pos)?; }
-        b'[' | b'{' => {
-            let close = if buf[*pos] == b'[' { b']' } else { b'}' };
-            let mut depth = 1u32;
-            *pos += 1;
-            while depth > 0 && *pos < buf.len() {
-                if buf[*pos] == b'"' {
-                    parse_string_raw(buf, pos)?;
-                } else {
-                    if buf[*pos] == close { depth -= 1; }
-                    if buf[*pos] == b'[' { depth += 1; }
-                    if buf[*pos] == b'{' { depth += 1; }
-                    *pos += 1;
-                }
+/// Advance to the next `:value` pair by scanning for `:` or `"` (skip strings)
+#[inline]
+fn to_next_value(p: &mut usize, buf: &[u8]) -> Option<()> {
+    loop {
+        let pos = memchr::memchr2(b':', b'"', &buf[*p..])?;
+        *p += pos;
+        if buf[*p] == b':' {
+            *p += 1;
+            while *p < buf.len() && matches!(buf[*p], b' ' | b'\t' | b'\n' | b'\r') {
+                *p += 1;
             }
-            if depth > 0 { return None; }
+            return Some(());
         }
-        _ => {
-            // number, true, false, null — consume alphanumeric
-            while *pos < buf.len() && (buf[*pos].is_ascii_alphanumeric() || buf[*pos] == b'.' || buf[*pos] == b'-') {
-                *pos += 1;
-            }
-        }
+        // It's a quote — skip the string
+        *p += 1;
+        let end = memchr::memchr(b'"', &buf[*p..])?;
+        *p += end + 1;
     }
+}
+
+/// Skip a quoted string value
+#[inline]
+fn skip_string(p: &mut usize, buf: &[u8]) -> Option<()> {
+    if *p < buf.len() && buf[*p] == b'"' {
+        *p += 1;
+    }
+    let end = memchr::memchr(b'"', &buf[*p..])?;
+    *p += end + 1;
     Some(())
+}
+
+// ---------- Scalar scanners (manual, no str::parse) ----------
+
+/// Manual f32 scanner — handles negatives, digits, fractional part, exponent
+#[inline]
+fn scan_f32(p: &mut usize, buf: &[u8]) -> f32 {
+    let (v, len) = parse_f32(&buf[*p..]);
+    *p += len;
+    v
+}
+
+/// Manual u32 scanner — fastest path for integers
+#[inline]
+fn scan_u32(p: &mut usize, buf: &[u8]) -> u32 {
+    let mut v = 0u32;
+    while *p < buf.len() && buf[*p].is_ascii_digit() {
+        v = v.wrapping_mul(10).wrapping_add((buf[*p] - b'0') as u32);
+        *p += 1;
+    }
+    v
+}
+
+#[inline]
+fn scan_bool(p: &mut usize, buf: &[u8]) -> bool {
+    let is_true = *p < buf.len() && buf[*p] == b't';
+    *p += if is_true { 4 } else { 5 };
+    is_true
+}
+
+#[inline]
+fn scan_string<'a>(p: &mut usize, buf: &'a [u8]) -> Option<&'a [u8]> {
+    if *p >= buf.len() || buf[*p] != b'"' {
+        return None;
+    }
+    *p += 1;
+    let start = *p;
+    let end = memchr::memchr(b'"', &buf[start..])?;
+    *p = start + end + 1;
+    Some(&buf[start..start + end])
+}
+
+/// MCC is a quoted digit string, e.g. "5411"
+#[inline]
+fn scan_mcc(p: &mut usize, buf: &[u8]) -> u32 {
+    if *p < buf.len() && buf[*p] == b'"' {
+        *p += 1;
+    }
+    let mut v = 0u32;
+    while *p < buf.len() && buf[*p].is_ascii_digit() {
+        v = v.wrapping_mul(10).wrapping_add((buf[*p] - b'0') as u32);
+        *p += 1;
+    }
+    if *p < buf.len() && buf[*p] == b'"' {
+        *p += 1;
+    }
+    v
+}
+
+/// Parse ISO 8601 timestamp: "2024-01-15T10:30:00Z"
+#[inline]
+fn scan_iso(p: &mut usize, buf: &[u8]) -> Option<(u16, u8, u8, u8, u8)> {
+    if *p < buf.len() && buf[*p] == b'"' {
+        *p += 1;
+    }
+    let s = &buf[*p..];
+    if s.len() < 20 {
+        return None;
+    }
+    let y = (s[0] - b'0') as u16 * 1000
+        + (s[1] - b'0') as u16 * 100
+        + (s[2] - b'0') as u16 * 10
+        + (s[3] - b'0') as u16;
+    let mo = (s[5] - b'0') * 10 + (s[6] - b'0');
+    let d = (s[8] - b'0') * 10 + (s[9] - b'0');
+    let h = (s[11] - b'0') * 10 + (s[12] - b'0');
+    let mi = (s[14] - b'0') * 10 + (s[15] - b'0');
+    *p += 20;
+    if let Some(off) = memchr::memchr(b'"', &buf[*p..]) {
+        *p += off + 1;
+    }
+    Some((y, mo, d, h, mi))
+}
+
+// ---------- parse_f32 — manual, handles digits/fraction/exponent ----------
+
+fn parse_f32(s: &[u8]) -> (f32, usize) {
+    let mut pos = 0;
+    let mut neg = false;
+    if pos < s.len() && s[pos] == b'-' {
+        neg = true;
+        pos += 1;
+    }
+    let mut int_part: u64 = 0;
+    while pos < s.len() && s[pos].is_ascii_digit() {
+        int_part = int_part.wrapping_mul(10).wrapping_add((s[pos] - b'0') as u64);
+        pos += 1;
+    }
+    let mut v = int_part as f64;
+    if pos < s.len() && s[pos] == b'.' {
+        pos += 1;
+        let frac_start = pos;
+        let mut frac: u64 = 0;
+        while pos < s.len() && s[pos].is_ascii_digit() {
+            if pos - frac_start < 18 {
+                frac = frac * 10 + (s[pos] - b'0') as u64;
+            }
+            pos += 1;
+        }
+        let digits = (pos - frac_start).min(18);
+        v += frac as f64 * FRAC_POWERS[digits];
+    }
+    // Handle optional exponent (e.g., 1.5e3)
+    if pos < s.len() && (s[pos] == b'e' || s[pos] == b'E') {
+        pos += 1;
+        let mut esign = 1i32;
+        if pos < s.len() && (s[pos] == b'+' || s[pos] == b'-') {
+            if s[pos] == b'-' {
+                esign = -1;
+            }
+            pos += 1;
+        }
+        let mut e = 0i32;
+        while pos < s.len() && s[pos].is_ascii_digit() {
+            e = e * 10 + (s[pos] - b'0') as i32;
+            pos += 1;
+        }
+        v *= 10f64.powi(esign * e);
+    }
+    if neg {
+        v = -v;
+    }
+    (v as f32, pos)
+}
+
+// ---------- Date utilities ----------
+
+fn day_of_week(y: u16, m: u8, d: u8) -> u8 {
+    const T: [u16; 12] = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
+    let ya = if m < 3 { (y - 1) as u32 } else { y as u32 };
+    let dow = (ya + ya / 4 - ya / 100 + ya / 400 + T[(m - 1) as usize] as u32 + d as u32) % 7;
+    ((dow + 6) % 7) as u8
+}
+
+fn days_since_epoch(y: i32, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y / 400 } else { (y - 399) / 400 };
+    let yoe = (y - era * 400) as u32;
+    let mm = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mm + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era as i64 * 146097 + doe as i64 - 719468
+}
+
+fn minutes_between(
+    y1: u16, mo1: u8, d1: u8, h1: u8, mi1: u8,
+    y2: u16, mo2: u8, d2: u8, h2: u8, mi2: u8,
+) -> u32 {
+    let d1 = days_since_epoch(y1 as i32, mo1 as u32, d1 as u32);
+    let d2 = days_since_epoch(y2 as i32, mo2 as u32, d2 as u32);
+    let m1 = d1 * 1440 + h1 as i64 * 60 + mi1 as i64;
+    let m2 = d2 * 1440 + h2 as i64 * 60 + mi2 as i64;
+    (m2 - m1).max(0) as u32
 }
