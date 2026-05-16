@@ -50,19 +50,36 @@ unsafe fn top_k_indices(dists: &[MaybeUninit<f32>; MAX_CENTROIDS], k: usize, n: 
     out
 }
 
-/// Minimal warmup: page-touch centroids + offsets for TLB residency.
+/// Warmup: page-touch centroids, offsets, blocks, and labels for TLB/cache residency.
+/// Then runs 20 synthetic queries to prime I-cache and branch predictor.
 /// No SIMD needed — no target_feature annotation required.
 pub fn warmup() {
     let ds = crate::data::dataset();
     let mut sink: u64 = 0;
+
+    // Page-touch centroids (224KB) and offsets (16KB) for TLB residency
     for v in ds.centroids.iter() {
         sink ^= v.to_bits() as u64;
     }
     for v in ds.offsets.iter() {
         sink ^= *v as u64;
     }
+
+    // Page-touch labels (~300KB) and blocks (~9MB) to prevent cold page faults
+    // on the first real request. Touching every 1024th entry is enough to
+    // populate the TLB without scanning every byte.
+    for (i, &l) in ds.labels.iter().enumerate().step_by(1024) {
+        sink ^= l as u64;
+        // Touch corresponding position in blocks too
+        let block_idx = i / 8;
+        if block_idx * 14 * 8 < ds.blocks.len() {
+            sink ^= unsafe { *ds.blocks.as_ptr().add(block_idx * 14 * 8) as u64 };
+        }
+    }
+
     let _ = sink;
-    // 20 quick synthetic queries for I-cache priming
+
+    // 20 quick synthetic queries for I-cache and branch predictor priming
     let mut state = 0x12345678u32;
     for _ in 0..20 {
         let mut q = [0.0f32; 14];
