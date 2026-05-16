@@ -2,9 +2,7 @@ use crate::data::{self, Dataset};
 use std::arch::x86_64::*;
 use std::mem::MaybeUninit;
 
-/// Two-tier search: fast probe first, only do full probe when borderline
-const FAST_NPROBE: usize = 5;
-const FULL_NPROBE: usize = 24;
+const NPROBE: usize = 40;
 const MAX_CENTROIDS: usize = 4096;
 const VECTOR_SCALE: f32 = 0.0001;
 
@@ -12,28 +10,24 @@ pub fn knn5_fraud_count(query: &[f32; 14], ds: &Dataset) -> u8 {
     unsafe { knn5_ivf(query, ds) }
 }
 
-/// Warm up: XOR all centroids + offsets to force page residency,
-/// then run 500 synthetic queries to warm CPU caches.
+/// Warm up: XOR centroids + offsets for TLB/ cache residency, then short warmup.
 pub fn warmup() {
     let ds = data::dataset();
 
     let mut sink: u64 = 0;
 
-    // XOR centroids to touch every cache line
+    // XOR centroids to force each cache line into L2/L3
     for v in ds.centroids.iter() {
         sink ^= v.to_bits() as u64;
     }
-
-    // XOR offsets too
     for &v in ds.offsets.iter() {
         sink ^= v as u64;
     }
-
     let _ = sink;
 
-    // 500 warmup queries with LCG PRNG
+    // Brief warmup — 50 queries to prime L1 I-cache and branch predictor
     let mut state = 0x12345678u32;
-    for _ in 0..500 {
+    for _ in 0..50 {
         let mut q = [0.0f32; 14];
         for v in q.iter_mut() {
             state = state.wrapping_mul(1664525).wrapping_add(1013904223);
@@ -44,7 +38,7 @@ pub fn warmup() {
 }
 
 // ---------------------------------------------------------------------------
-// Top-level KNN: two-tier IVF search
+// Top-level KNN — single-tier search
 // ---------------------------------------------------------------------------
 
 #[target_feature(enable = "avx2,fma")]
@@ -58,18 +52,8 @@ unsafe fn knn5_ivf(query: &[f32; 14], ds: &Dataset) -> u8 {
         q_vecs[d] = _mm256_set1_ps(query[d]);
     }
 
-    // Tier 1: fast probe
-    let fast_probes = top_n_from_dists::<FAST_NPROBE>(&dists, ds.k);
-    let fast = scan_and_count(&fast_probes, ds, &q_vecs);
-
-    // If not in {2, 3}, we're confident — skip full probe
-    if fast != 2 && fast != 3 {
-        return fast;
-    }
-
-    // Tier 2: full probe for borderline cases
-    let full_probes = top_n_from_dists::<FULL_NPROBE>(&dists, ds.k);
-    scan_and_count(&full_probes, ds, &q_vecs)
+    let probes = top_n_from_dists::<NPROBE>(&dists, ds.k);
+    scan_and_count(&probes, ds, &q_vecs)
 }
 
 // ---------------------------------------------------------------------------
@@ -86,7 +70,7 @@ unsafe fn compute_centroid_dists(
     let cp = ds.centroids.as_ptr();
     let dp = dists.as_mut_ptr() as *mut f32;
 
-    // Dimension 0 (scalar init)
+    // Dimension 0 (init)
     {
         let qd = _mm256_set1_ps(query[0]);
         let mut ci = 0usize;
@@ -138,7 +122,7 @@ unsafe fn compute_centroid_dists(
 }
 
 // ---------------------------------------------------------------------------
-// Select top-N centroids by distance (AVX2 mask-scan)
+// Select top-N centroids (AVX2 mask-scan)
 // ---------------------------------------------------------------------------
 
 #[target_feature(enable = "avx2,fma")]
@@ -151,7 +135,6 @@ unsafe fn top_n_from_dists<const N: usize>(
     let dp = dists.as_ptr() as *const f32;
     let mut ci = 0usize;
 
-    // Process 8 centroids at a time with AVX2
     while ci + 8 <= k {
         let d8 = _mm256_loadu_ps(dp.add(ci));
         let mask = _mm256_movemask_ps(_mm256_cmp_ps(
@@ -180,7 +163,6 @@ unsafe fn top_n_from_dists<const N: usize>(
         ci += 8;
     }
 
-    // Tail: remaining centroids (scalar)
     while ci < k {
         let di = *dp.add(ci);
         if di < top_dists[N - 1] {
@@ -197,7 +179,7 @@ unsafe fn top_n_from_dists<const N: usize>(
 }
 
 // ---------------------------------------------------------------------------
-// Scan clusters: accumulate distances via FMA, early-terminate, prefetch
+// Scan clusters: AVX2 FMA block scan with early termination and prefetch
 // ---------------------------------------------------------------------------
 
 #[target_feature(enable = "avx2,fma")]
@@ -208,7 +190,6 @@ unsafe fn scan_and_count(probes: &[usize], ds: &Dataset, q_vecs: &[__m256; 14]) 
     let labels_ptr = ds.labels.as_ptr();
 
     for &ci in probes {
-        // Convert label offsets to block offsets (both are multiples of 8)
         let start = *ds.offsets.as_ptr().add(ci) as usize / 8;
         let end = *ds.offsets.as_ptr().add(ci + 1) as usize / 8;
         scan_blocks(
@@ -225,9 +206,9 @@ unsafe fn scan_and_count(probes: &[usize], ds: &Dataset, q_vecs: &[__m256; 14]) 
     top.iter().filter(|(_, l)| *l == 1).count() as u8
 }
 
-/// Process one cluster's blocks: for each block of 8 vectors, compute
-/// squared Euclidean distance in f32 space using AVX2 FMA, with
-/// early termination after 8 dimensions and prefetch 8 blocks ahead.
+/// Process 8 vectors per block using AVX2 FMA.
+/// Early termination after 8 dims — skip blocks where no vector beats threshold.
+/// Prefetch 8 blocks ahead to overlap memory latency.
 #[target_feature(enable = "avx2,fma")]
 unsafe fn scan_blocks(
     q_vecs: &[__m256; 14],
@@ -240,9 +221,6 @@ unsafe fn scan_blocks(
 ) {
     let scale = _mm256_set1_ps(VECTOR_SCALE);
 
-    // Process 2 dimensions at a time using interleaved accumulators.
-    // acc0 accumulates even dims, acc1 accumulates odd dims.
-    // After all 7 pairs, sum acc0+acc1 for total per-vector distance.
     macro_rules! dim_pair {
         ($acc0:expr, $acc1:expr, $bb:expr, $d:expr) => {{
             let r0 = _mm_loadu_si128(blocks_ptr.add($bb + $d * 8) as *const __m128i);
@@ -257,22 +235,14 @@ unsafe fn scan_blocks(
     }
 
     'block: for block_i in start_block..end_block {
-        // Prefetch 8 blocks ahead to overlap memory latency
-        let prefetch_block = block_i + 8;
-        if prefetch_block < end_block {
-            // Each block = 112 i16s = 224 bytes
-            // Prefetch both halves
-            _mm_prefetch(
-                blocks_ptr.add(prefetch_block * 112) as *const i8,
-                _MM_HINT_T0,
-            );
-            _mm_prefetch(
-                blocks_ptr.add(prefetch_block * 112 + 56) as *const i8,
-                _MM_HINT_T0,
-            );
+        // Prefetch 8 blocks ahead
+        let pf = block_i + 8;
+        if pf < end_block {
+            _mm_prefetch(blocks_ptr.add(pf * 112) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(blocks_ptr.add(pf * 112 + 56) as *const i8, _MM_HINT_T0);
         }
 
-        let bb = block_i * 112; // i16 offset for this block (14 dims * 8 vecs)
+        let bb = block_i * 112;
         let threshold = _mm256_set1_ps(top[*worst_idx].0);
 
         let mut acc0 = _mm256_setzero_ps();
@@ -284,7 +254,7 @@ unsafe fn scan_blocks(
         dim_pair!(acc0, acc1, bb, 4);
         dim_pair!(acc0, acc1, bb, 6);
 
-        // Check partial sum: if no vector passes threshold after 8 dims, skip
+        // Early termination: after 8 dims, skip if nothing beats threshold
         let partial = _mm256_add_ps(acc0, acc1);
         if _mm256_movemask_ps(_mm256_cmp_ps(partial, threshold, _CMP_LT_OQ)) == 0 {
             continue 'block;
@@ -301,7 +271,6 @@ unsafe fn scan_blocks(
             continue;
         }
 
-        // Unpack surviving vectors and update top-K
         let mut dists_buf = [0.0f32; 8];
         _mm256_storeu_ps(dists_buf.as_mut_ptr(), acc);
         let label_base = block_i * 8;
@@ -311,7 +280,7 @@ unsafe fn scan_blocks(
             let di = dists_buf[slot];
             if di < top[*worst_idx].0 {
                 top[*worst_idx] = (di, *labels_ptr.add(label_base + slot));
-                // Find new worst (simplified linear scan over 5 elements — tiny)
+                // Find new worst among 5 elements (linear scan — tiny)
                 let mut wi = 0;
                 let mut wv = top[0].0;
                 for j in 1..5 {
